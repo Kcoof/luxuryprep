@@ -1,0 +1,9 @@
+﻿# Copy this file to .sec and fill in your real values
+#   copy .sec.example .sec
+#
+# Coding Plan MUST use: https://api.z.ai/api/coding/paas/v4
+# General metered API:  https://api.z.ai/api/paas/v4
+
+GLM_API_KEY=your_api_key_here
+GLM_BASE_URL=https://api.z.ai/api/coding/paas/v4
+GLM_MODEL=GLM-5.2

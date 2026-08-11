@@ -1,0 +1,23 @@
+# Secrets
+.sec
+*.sec
+!.sec.example
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# Next.js / Node
+node_modules/
+.next/
+out/
+.vercel
+
+# Logs / OS
+*.log
+.DS_Store
+Thumbs.db
+
+# Supabase local (if used later)
+.supabase/
