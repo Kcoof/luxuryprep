@@ -1,0 +1,31 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: 248 250 252; /* slate-50 */
+  --foreground: 15 23 42;    /* slate-900 */
+  --frame: 2 6 23;           /* slate-950 */
+  --success: 16 185 129;     /* emerald-500 */
+  --pending: 245 158 11;     /* amber-500 */
+  --danger: 244 63 94;       /* rose-500 */
+}
+
+html,
+body {
+  background-color: rgb(var(--background));
+  color: rgb(var(--foreground));
+  direction: rtl;
+}
+
+body {
+  font-family: "Segoe UI", "Tahoma", system-ui, -apple-system, "Arial",
+    sans-serif;
+}
+
+.card-frame {
+  background-color: #ffffff;
+  border: 1px solid #e2e8f0; /* slate-200 */
+  border-radius: 0.75rem;
+  box-shadow: 0 1px 2px 0 rgba(15, 23, 42, 0.06);
+}

@@ -1,105 +1,177 @@
-# Foundation Record — Branch Health (`Newproject`)
+# Foundation Record — Daily Financial Closing & POS Audit (`luxuryprep` / `Newproject`)
 
-**Status:** Confirmed (user-adjusted)  
-**Date:** 2026-08-11  
-**Project Constitution:** Active → settled  
-**Next:** Model Constitution (GLM authors; Claude → Codex review; CUROK transport)
+**Status:** Confirmed (user 2026-08-11) — product pivot + GLM extract  
+**Repo:** https://github.com/Kcoof/luxuryprep  
+**Project Constitution:** Settled  
+**Model Constitution:** Active — M1 in progress  
+**Supersedes:** prior “Branch Health / tech-health” product idea (kept only as archived sibling reference)
 
 ---
 
 ## Core idea
 
-Internal IT tool for a coffee company. Store **branches** submit daily tech-health reports; **IT admins** monitor every branch from one dashboard. Entire UI is **Arabic**, right-to-left (RTL).
+Enterprise **Daily Financial Closing & POS Audit System** (نظام الإغلاق المالي اليومي والمراجعة للفروع) for multi-branch retail/restaurant businesses in **Saudi Arabia** (SAR, Arabic RTL). Branch cashiers submit daily Foodics Z-report / closing packages (images + optional payment proofs); **GLM** extracts financial fields; cashiers confirm; **financial auditors** approve/reject, then unlock unified reports and a digital audit log.
 
 ## Vision
 
-`npm install && npm run build` succeeds; app runs locally and on **Vercel**; Supabase project is seeded; branch and admin flows match product behavior from `BUILD_PROMPT.md` (UX/pages), with the backend remapped to Supabase.
+- Local `npm run build` / `npm run dev` and **Vercel** deploy succeed.
+- Supabase holds branches, closings, audit logs; Storage holds receipt images.
+- **GLM** (Z.ai) vision/extract extracts Foodics receipt fields with confidence scores.
+- Cashier 3-step flow and auditor 3-tab portal work end-to-end in Arabic RTL.
+- No silent duplicate closing for same branch + business date without confirmation.
+- Auditor unified reports stay **gated** until all pending closings are cleared.
 
 ## Structure + hierarchy
 
-**Canonical home:** this folder (`Newproject`) only. Sibling `branch-health` / `branch-health-fresh` are **read-only Firebase reference**, then archived after cutover.
+**Canonical home:** `Newproject` / GitHub `luxuryprep` only.
 
-**Decision order:** User → Project Constitution (this record) → Model Constitution → GLM authors → Claude review → Codex review → CUROK byte-for-byte apply.
+**Decision order:** User → this Foundation → Model Constitution → GLM authors → Claude → Codex → CUROK transport.
 
-**Technical order:** Postgres schema / types → Supabase client → UI kit → pages → RLS + Storage policies → Vercel env + seed docs.
+**Technical order:**
+1. Types / Postgres schema (`FinancialFields`, `DailyClosing`, audit log)
+2. Supabase client + Storage buckets
+3. Design system (RTL + palette below)
+4. Cashier portal (3-step closing)
+5. `POST` AI analyze API (**GLM** / Z.ai)
+6. Auditor portal (approvals → gated reports → audit log)
+7. RLS / seed / Vercel env
 
-**Layout (single app at repo root):** Next.js App Router under `app/`; shared `app/types`, `app/lib` (Supabase client), `app/components`; SQL migrations under `supabase/`.
+**Layout (adapted for Vercel + locked Supabase):**
+
+```
+Newproject/
+├─ FOUNDATION.md
+├─ app/                         # Next.js App Router (Arabic RTL)
+│  ├─ api/analyze-closing-image # GLM vision/extract (server) — replaces Express /api
+│  ├─ (cashier)/…               # Branch employee portal
+│  ├─ (auditor)/…               # Financial auditor portal
+│  ├─ types/                    # Branch, FinancialFields, DailyClosing, AuditLog
+│  ├─ lib/supabase.ts
+│  └─ components/…
+├─ supabase/migrations/         # tables + RLS + storage
+├─ .env.local                   # Supabase keys (gitignored)
+├─ .sec                         # GLM_API_KEY / GLM_BASE_URL / GLM_MODEL (gitignored)
+└─ …
+```
+
+**Stack lock (reconciled):**
+
+| Brief suggested | Foundation lock (this project) |
+|-----------------|--------------------------------|
+| Vite + React + Express `:3000` | **Next.js 14 App Router** on **Vercel** (same UX; API route instead of Express) |
+| Generic `Db` adapter | **Supabase** Postgres + Storage + Auth + Realtime (already approved) |
+| `@google/genai` Gemini Vision | **Replaced by GLM** — server-only API route using Z.ai Coding Plan (`GLM-5.2`, credentials from `.sec` / env) |
+| Foodics Z-report image audit | **Keep** — core product |
+
+## Design system (imported)
+
+- **Language:** Arabic RTL (`dir="rtl"`); financial terms (إجمالي المبيعات، الكاش الفعلي المورد، العجز/الزيادة، العكسيات والمرتجعات).
+- **Palette:** Slate-900/950 framing; Slate-50/white content; Emerald success/verified cash; Amber pending/reversals; Rose shortage/reject.
+- **Layout:** High-contrast, dense dashboard grids, responsive mobile fallback; Lucide icons only.
+- **Currency:** SAR.
+
+## Roles & portals (imported)
+
+### Portal 1 — Cashier / branch employee (شاشة الكاشير)
+
+- Branch **locked** to assigned `branchId` (`isBranchLocked`); show read-only badge. Auditors/admins may select any branch.
+- **3-step submission:**
+  1. Upload Foodics Z-report / closing image (+ optional Mada / cash deposit / Visa proofs); `businessDate`; optional `manualActualCash`.
+  2. **GLM** extract → review/edit fields → show `shortageOrExcess = cashActualHanded - cashSystem`; guard double-submit (`isSaving`).
+  3. Success card with Closing ID (e.g. `close-123456`); status «بانتظار اعتماد الإدارة المالية».
+- **Rule:** never duplicate same `branchId` + `businessDate` without explicit confirmation.
+
+### Portal 2 — Financial auditor (الإدارة المالية والمراجعة)
+
+1. **Approvals:** list closings; filter pending/approved/rejected; split-screen modal (image zoom vs AI / cashier / auditor fields; flag manual edits); Approve / Reject + comment.
+2. **Unified reports (gated):** locked while `pendingCount > 0` with Arabic alert; when clear, KPIs for gross sales, actual cash handed, net shortage/excess, reversals/refunds; tables + Excel/Print.
+3. **Digital audit log:** timeline of upload, AI extract + confidence, cashier edits, approve/reject.
+
+## Data schemas (imported — map to Supabase)
+
+Core TypeScript contracts (implementation may use snake_case columns):
+
+- `Branch` — `id`, `name`, `city`
+- `FinancialFields` — `grossSales`, `netSales`, `cashSystem`, `cashActualHanded`, `spanSystem`, `deliveryAppsSystem`, `reversedTransactions`, `shortageOrExcess`
+- `FieldConfidence` — optional 0–1 per financial field
+- `DailyClosing` — ids, `businessDate`, status `pending|approved|rejected`, image URLs, `aiExtractedData`, `aiConfidence`, `reviewedData`, `manuallyModifiedFields`, auditor fields, timestamps
+- `DailyClosingAuditLog` — `closingId`, actor role (`cashier|manager|auditor|ai`), action (`uploaded|ai_extracted|cashier_confirmed|approved|rejected|modified`), comment, timestamp
+
+**Tables (v1):** `branches`, `daily_closings`, `daily_closing_audit_logs` (+ Storage for report/proof images).  
+**Auth:** Supabase Auth — roles `cashier` / `manager` / `auditor` (branch assignment for non-auditors).
+
+## AI Vision (GLM — user override 2026-08-11)
+
+- **No Gemini.** Image analysis uses **GLM** via Z.ai Coding Plan API.
+- Server endpoint: `POST /api/analyze-closing-image` (Next.js route).
+- Body: `{ imageBase64 }` (limit ~10mb).
+- Credentials: `GLM_API_KEY`, `GLM_BASE_URL=https://api.z.ai/api/coding/paas/v4`, `GLM_MODEL=GLM-5.2` (from `.sec` locally; mirror as server env on Vercel — never `NEXT_PUBLIC_`).
+- Prompt task: expert POS Z-report reader; respond **ONLY** with raw JSON: `grossSales`, `netSales`, `cashSystem`, `spanSystem`, `deliveryAppsSystem`, `reversedTransactions`.
+- Client computes/displays `cashActualHanded` (manual or from proof flow) and `shortageOrExcess`.
+- Confidence scores: include when GLM returns them; otherwise mark fields unscoped / default handling in UI.
 
 ## Feasibility across empires
 
 | Empire | Verdict |
 |--------|---------|
-| Product / UX | Pass — pages and roles from BUILD_PROMPT / siblings |
-| Supabase + Vercel | Pass — `@supabase/supabase-js`, env vars on Vercel |
-| Arabic RTL / Windows | Risk — UTF-8 no BOM; avoid PowerShell `>` for Arabic files |
-| Multi-model workflow | Pass — small milestones |
-| Firebase siblings | Reference only — do **not** ship Firestore in v1 |
-
-## Database lock (user override 2026-08-11)
-
-**Main database: Supabase (Postgres).**  
-**Storage: Supabase Storage.**  
-**Live admin updates: Supabase Realtime.**  
-Firebase / Firestore is **out of scope for v1**.
-
-### Auth (v1 with Supabase)
-
-- **Admin:** Supabase Auth (email + password). No plaintext `admins.password` table.
-- **Branch:** Branch-code login against `branches` table (same UX as BUILD_PROMPT); session in `localStorage` (`branchId` / `branchName`).
-
-### Tables (map from former Firestore collections)
-
-- `branches` — id (text PK, e.g. `1001`), name, address, phone, created_at  
-- `daily_reports` — branch health reports (status, systems, notes, photo URLs, date, time)  
-- `issues` — auto-created from checklist failures  
-- `visit_requests` — IT visit requests + optional photo  
-- `comments` — admin comments on a branch  
-- Profiles / role claim for admins via Supabase Auth (not a plaintext password store)
+| Product / KSA retail finance | Pass — clear cashier + auditor workflows |
+| Supabase + Vercel | Pass — already connected (`uujujcudeucabykfztic`, GitHub `luxuryprep`) |
+| GLM Vision/extract (Z.ai) | Pass if `GLM_API_KEY` available server-side; verify multimodal image support for receipt OCR in M3 |
+| Arabic RTL / Windows | Risk — UTF-8 discipline |
+| Brief’s Vite+Express | **Adapted** — not used as-is; Next API routes instead |
+| Gemini | **Out** — replaced by GLM per user |
+| Old Branch Health Firebase siblings | Out of product scope — archive reference only |
 
 ## Clear foundation checklist
 
 **Understood**
 
-- [x] Product = Branch Health (Arabic RTL)
-- [x] Canonical repo = `Newproject`
-- [x] Main DB = Supabase (user-approved)
-- [x] Deploy target = Vercel
-- [x] GLM sole author under Model Constitution after this record
-- [x] BUILD_PROMPT is UX/product contract; stack backend is Supabase, not Firebase
+- [x] Product = Daily Financial Closing & POS Audit (not Branch Health tech checklist)
+- [x] Arabic RTL + SAR + Foodics receipt auditing
+- [x] Supabase = main DB/Storage/Auth
+- [x] Vercel + GitHub `luxuryprep`
+- [x] **GLM** (not Gemini) for Z-report extraction
+- [x] Cashier 3-step + auditor 3-tab (gated reports)
+- [x] Duplicate branch+date guard; branch lock for cashiers
+- [x] Supabase URL + publishable key present in `.env.local` (gitignored)
+- [x] GLM credentials pattern via `.sec` / `.sec.example`
 
-**Open (non-blocking for M1)**
+**Still needed before / during M1–M2**
 
-- [ ] Exact Supabase project URL / keys (user supplies in `.env.local`, never commit)
-- [ ] Whether branch codes stay opaque text IDs (`1001`) — default: yes
+- [x] User confirms this updated Foundation (product pivot + GLM) — confirmed 2026-08-11
+- [ ] `GLM_API_KEY` available to the **server** on Vercel (not exposed to browser)
+- [ ] Seed branch list + auditor/cashier users
 
 ## v1 scope / out of scope
 
-**In v1:** Full Branch Health UX; Arabic RTL; Supabase Postgres + Storage + Realtime; admin via Supabase Auth; Vercel-ready; build green; seed SQL/docs; RLS that is not world-open.
+**In v1:** Cashier portal (3 steps), **GLM** extract API, auditor approvals + gated unified reports + audit log, Supabase persistence/Storage, Arabic RTL design system above, duplicate-date confirmation, branch lock, Vercel deploy.
 
-**Out of v1:** Firebase/Firestore; mobile apps; multi-company tenancy; analytics beyond the six admin stats; editing sibling Firebase folders after cutover.
+**Out of v1:** Gemini; Branch Health IT checklist product; Firebase; multi-company SaaS tenancy; native mobile apps; full Foodics live API sync (image/Z-report audit only); petty cash module beyond what lands in closing fields (defer unless user re-opens).
 
 ## Glossary
 
-- **Empire** — platform/domain/stack the project must work in  
-- **Canonical** — the one copy that may be edited (`Newproject`)  
-- **Transport** — CUROK applies GLM output byte-for-byte only  
-- **Sorted** — governed foundation + working v1 app, not a feature name  
+- **Closing** — one branch’s daily financial package for a `businessDate`
+- **Shortage/Excess** — `cashActualHanded - cashSystem` (عجز / زيادة)
+- **Gated reports** — unified financial reports locked while any closing is `pending`
+- **Publishable key** — Supabase anon/public client key
+- **Transport** — CUROK applies GLM output byte-for-byte only
 
 ## Open points escalated to user
 
-None blocking. Supabase approved as main database (2026-08-11).
+1. Confirm GLM multimodal/image path works for Foodics receipts during M3 (fallback: manual entry if vision unavailable).
+2. Seed branch list + auditor/cashier users when ready.
 
 ---
 
-## Milestones (Model Constitution)
+## Milestones
 
-1. **M0** — This `FOUNDATION.md` (done when written)  
-2. **M1** — Skeleton: Next configs, types, Supabase client, UI kit, page shells, `npm run build`  
-3. **M2** — Branch flows: login, dashboard, checklist, visit + Storage  
-4. **M3** — Admin flows: Auth, stats + Realtime, BranchCard, detail tabs + comments  
-5. **M4** — SQL migrations, RLS, Storage policies, README seed, `.env.local.example`  
-6. **M5** — Archive Firebase siblings as read-only reference  
+1. **M0** — Foundation — **done** (confirmed 2026-08-11)  
+2. **M1** — Skeleton: Next + types + Supabase client + design tokens + portal shells; `npm run build` — **done** (GLM R3 approved by Claude+Codex; applied 2026-08-11)  
+3. **M2** — Cashier 3-step + Storage uploads + duplicate-date guard + branch lock  
+4. **M3** — **GLM** `/api/analyze-closing-image` + confirmation UI  
+5. **M4** — Auditor tabs (approvals, gated reports, audit log)  
+6. **M5** — Migrations/RLS/seed/README; Vercel env complete (`GLM_API_KEY` server-side)
 
 ---
 
-`Foundation confirmed — hand off to model-constitution` (await user “start M1” / implementation request).
+`Foundation confirmed — hand off to model-constitution` — M1 brief issued to GLM.
