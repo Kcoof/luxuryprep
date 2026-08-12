@@ -1,0 +1,2015 @@
+===FILE: app/api/analyze-closing-image/route.ts===
+// M3: GLM vision OCR for Z-report images.
+// Server-only route — never bundle GLM secrets into the client.
+// Constitution rule: never reference NEXT_PUBLIC_ for GLM env vars.
+import { NextRequest, NextResponse } from "next/server";
+
+export const runtime = "nodejs";
+
+const MAX_BYTES = 10 * 1024 * 1024; // 10 MB decoded
+const UPSTREAM_TIMEOUT_MS = 60_000;
+
+const ALLOWED_FIELDS = [
+  "grossSales",
+  "netSales",
+  "cashSystem",
+  "spanSystem",
+  "deliveryAppsSystem",
+  "reversedTransactions",
+  "cashActualHanded",
+] as const;
+
+type ExtractableField = (typeof ALLOWED_FIELDS)[number];
+type ExtractedFields = Partial<Record<ExtractableField, number>>;
+
+interface AnalyzeResponse {
+  fields: ExtractedFields;
+  finishReason: string | null;
+  model: string;
+}
+
+function buildPrompt(): string {
+  return [
+    "You are an OCR assistant that extracts financial values from an Arabic Z-report (daily point-of-sale closing report) image.",
+    "Return ONLY raw JSON. Do not include prose, markdown, or code fences.",
+    "If a value is missing, illegible, or ambiguous, return null for that key.",
+    "Strip thousands separators (commas or spaces) and use a dot (.) as the decimal separator.",
+    "Do not invent values. Do not compute shortage/excess.",
+    "",
+    "Return exactly these keys (Arabic label in parentheses for guidance):",
+    '- "grossSales": إجمالي المبيعات',
+    '- "netSales": صافي المبيعات',
+    '- "cashSystem": النقدية حسب النظام',
+    '- "spanSystem": سبان',
+    '- "deliveryAppsSystem": تطبيقات التوصيل',
+    '- "reversedTransactions": حركات مرتجعة',
+    '- "cashActualHanded": النقدية المسلّمة فعليًا',
+    "",
+    'Example output: {"grossSales": 1234.56, "netSales": 1100.00, "cashSystem": 500.00, "spanSystem": 200.00, "deliveryAppsSystem": 150.00, "reversedTransactions": 25.00, "cashActualHanded": 498.00}',
+  ].join("\n");
+}
+
+function stripCodeFence(raw: string): string {
+  let s = raw.trim();
+  if (s.startsWith("```")) {
+    s = s.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
+  }
+  return s.trim();
+}
+
+function coerceFields(parsed: unknown): ExtractedFields {
+  const out: ExtractedFields = {};
+  if (!parsed || typeof parsed !== "object") return out;
+  const obj = parsed as Record<string, unknown>;
+  for (const key of ALLOWED_FIELDS) {
+    const v = obj[key];
+    if (v === null || v === undefined) continue;
+    const n = Number(v);
+    if (Number.isFinite(n)) out[key] = n;
+  }
+  return out;
+}
+
+function decodeBase64Length(base64: string): number {
+  // Buffer.from never throws on invalid base64 input — it produces lossy output.
+  // byteLength is exact and safe.
+  return Buffer.from(base64, "base64").byteLength;
+}
+
+export async function POST(req: NextRequest): Promise<Response> {
+  const apiKey = process.env.GLM_API_KEY;
+  const baseUrlRaw = process.env.GLM_BASE_URL;
+  const visionModel = process.env.GLM_VISION_MODEL;
+
+  if (!apiKey || !baseUrlRaw || !visionModel) {
+    return NextResponse.json(
+      { error: "خدمة تحليل الصور غير مُهيّأة. يُرجى التواصل مع الإدارة." },
+      { status: 503 },
+    );
+  }
+
+  // Normalize base URL: a trailing slash would yield "//chat/completions".
+  const baseUrl = baseUrlRaw.replace(/\/$/, "");
+
+  let body: unknown;
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json(
+      { error: "صيغة الطلب غير صحيحة." },
+      { status: 400 },
+    );
+  }
+
+  const { imageBase64 } = (body ?? {}) as { imageBase64?: unknown };
+  if (typeof imageBase64 !== "string" || imageBase64.length === 0) {
+    return NextResponse.json(
+      { error: "لم يتم توفير صورة." },
+      { status: 400 },
+    );
+  }
+
+  let mime = "image/jpeg";
+  let dataUrl: string;
+  if (imageBase64.startsWith("data:")) {
+    const m = imageBase64.match(/^data:([^;]+);base64,/);
+    if (!m) {
+      return NextResponse.json(
+        { error: "صيغة الصورة غير صحيحة." },
+        { status: 400 },
+      );
+    }
+    mime = m[1];
+    dataUrl = imageBase64;
+  } else {
+    // Bare base64 without a data-URL prefix. The cashier page always sends a
+    // proper data: URL via FileReader.readAsDataURL(), so this path is an
+    // internal fallback only. We assume JPEG (the most common phone-camera
+    // format). By design, bare-base64 inputs bypass the data-URL MIME check
+    // below; the upstream GLM API will reject truly invalid payloads.
+    dataUrl = `data:${mime};base64,${imageBase64}`;
+  }
+
+  if (!mime.startsWith("image/")) {
+    return NextResponse.json(
+      { error: "الملف المُرفق ليس صورة مدعومة." },
+      { status: 415 },
+    );
+  }
+
+  const rawBase64 = dataUrl.split(",")[1] ?? "";
+  const byteLength = decodeBase64Length(rawBase64);
+  if (byteLength > MAX_BYTES) {
+    return NextResponse.json(
+      { error: "حجم الصورة كبير جدًا (الحد الأقصى ١٠ ميجابايت)." },
+      { status: 413 },
+    );
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
+
+  try {
+    const upstream = await fetch(`${baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: visionModel,
+        temperature: 0,
+        max_tokens: 2048,
+        thinking: { type: "disabled" },
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: buildPrompt() },
+              { type: "image_url", image_url: { url: dataUrl } },
+            ],
+          },
+        ],
+      }),
+      signal: controller.signal,
+    });
+
+    if (!upstream.ok) {
+      // Log server-side only; never echo upstream details to the browser.
+      const text = await upstream.text().catch(() => "");
+      console.error(
+        "[analyze-closing-image] upstream non-ok",
+        upstream.status,
+        text.slice(0, 500),
+      );
+      return NextResponse.json(
+        { error: "تعذّر تحليل الصورة من مزوّد الخدمة." },
+        { status: 502 },
+      );
+    }
+
+    const data = (await upstream.json()) as {
+      choices?: Array<{
+        message?: { content?: string };
+        finish_reason?: string;
+      }>;
+    };
+
+    const choice = data.choices?.[0];
+    const content = choice?.message?.content ?? "";
+    const finishReason = choice?.finish_reason ?? null;
+
+    if (!content.trim()) {
+      return NextResponse.json(
+        {
+          error: "لم يتم استخراج أي بيانات من الصورة.",
+          finishReason,
+        },
+        { status: 502 },
+      );
+    }
+
+    const cleaned = stripCodeFence(content);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(cleaned);
+    } catch (e) {
+      console.error(
+        "[analyze-closing-image] failed to parse model JSON",
+        cleaned.slice(0, 500),
+        e,
+      );
+      return NextResponse.json(
+        {
+          error: "تعذّر تفسير نتيجة التحليل.",
+          finishReason,
+        },
+        { status: 502 },
+      );
+    }
+
+    const fields = coerceFields(parsed);
+    const payload: AnalyzeResponse = { fields, finishReason, model: visionModel };
+    return NextResponse.json(payload);
+  } catch (err) {
+    if ((err as Error)?.name === "AbortError") {
+      return NextResponse.json(
+        { error: "انتهت مهلة تحليل الصورة. يُرجى المحاولة مرة أخرى." },
+        { status: 504 },
+      );
+    }
+    console.error("[analyze-closing-image] unexpected error", err);
+    return NextResponse.json(
+      { error: "حدث خطأ غير متوقّع أثناء التحليل." },
+      { status: 500 },
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+}
+===ENDFILE===
+===FILE: app/cashier/page.tsx===
+"use client";
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import Link from "next/link";
+import {
+  ArrowRight,
+  Calculator,
+  Check,
+  Lock,
+  AlertCircle,
+  RotateCcw,
+  Sparkles,
+  Loader2,
+} from "lucide-react";
+import {
+  Branch,
+  FinancialFields,
+  EMPTY_FINANCIAL_FIELDS,
+  computeShortageOrExcess,
+} from "../types";
+import { loadBranches } from "../lib/branches";
+import {
+  checkDuplicateClosing,
+  saveClosing,
+  ClosingResult,
+} from "../lib/closings";
+
+type Step = 1 | 2 | 3;
+
+const BRANCH_SESSION_KEY = "cashier_selected_branch";
+
+interface SavedBranch {
+  id: string;
+  name: string;
+}
+
+type MonetaryKey =
+  | "grossSales"
+  | "netSales"
+  | "cashSystem"
+  | "cashActualHanded"
+  | "spanSystem"
+  | "deliveryAppsSystem"
+  | "reversedTransactions";
+
+const AI_EXTRACTABLE_FIELDS: MonetaryKey[] = [
+  "grossSales",
+  "netSales",
+  "cashSystem",
+  "cashActualHanded",
+  "spanSystem",
+  "deliveryAppsSystem",
+  "reversedTransactions",
+];
+
+const EMPTY_RAW_VALUES: Record<MonetaryKey, string> = {
+  grossSales: "",
+  netSales: "",
+  cashSystem: "",
+  cashActualHanded: "",
+  spanSystem: "",
+  deliveryAppsSystem: "",
+  reversedTransactions: "",
+};
+
+// Align with migration 003 allowed_mime_types — gif is rejected by the bucket.
+const ACCEPTED_IMAGE_TYPES = "image/jpeg,image/png,image/webp,image/heic";
+
+type FieldBadge = "ai" | "manual" | null;
+
+/**
+ * B1: parse localized monetary input safely.
+ *
+ * Normalizes Arabic-Indic digits, maps Arabic separators, then decides which
+ * single character is the decimal point — stripping all other separators and
+ * converting ONLY that one character. Never re-normalizes after conversion.
+ *
+ * Verified test cases:
+ *   "1234"      -> 1234
+ *   "1234.50"   -> 1234.5
+ *   "1,234.50"  -> 1234.5
+ *   "1.234,50"  -> 1234.5
+ *   "1,234"     -> 1234
+ *   "12,5"      -> 12.5
+ *   "١٢٣٫٥٠"     -> 123.5
+ *   "١٬٢٣٤٫٥٠"   -> 1234.5
+ *   "-25.00"    -> -25
+ *   "0"         -> 0
+ */
+function parseLocalizedNumber(raw: string): number | null {
+  if (typeof raw !== "string") return null;
+
+  // Step 1: Map Arabic-Indic (٠-٩) and Eastern Arabic (۰-۹) digits to ASCII.
+  let s = raw
+    .replace(/[\u0660-\u0669]/g, (d) => String(d.charCodeAt(0) - 0x0660))
+    .replace(/[\u06f0-\u06f9]/g, (d) => String(d.charCodeAt(0) - 0x06f0));
+
+  // Step 2: Map Arabic separators to ASCII equivalents.
+  //   U+066B (٫) = Arabic decimal separator -> "."
+  //   U+066C (٬) = Arabic thousands separator -> strip
+  //   U+060C (،) = Arabic comma -> ","
+  s = s
+    .replace(/[\u066b]/g, ".")
+    .replace(/[\u066c]/g, "")
+    .replace(/[\u060c]/g, ",");
+
+  // Step 3: Strip whitespace used as thousands separators.
+  s = s.replace(/[\s\u2009\u202f]/g, "");
+
+  s = s.trim();
+  if (s === "" || s === "-" || s === ".") return null;
+
+  // Step 4: Decide which character is the decimal separator, then build
+  // the integer and fractional parts independently. This ensures exactly
+  // ONE normalization pass — no re-normalization of already-converted
+  // values.
+  const lastDot = s.lastIndexOf(".");
+  const lastComma = s.lastIndexOf(",");
+
+  let intPart = "";
+  let fracPart = "";
+
+  if (lastDot >= 0 && lastComma >= 0) {
+    // Both present: the rightmost separator is the decimal point.
+    if (lastDot > lastComma) {
+      // Dot is decimal — commas are thousands.
+      intPart = s.slice(0, lastDot).replace(/,/g, "");
+      fracPart = s.slice(lastDot + 1);
+    } else {
+      // Comma is decimal — dots are thousands.
+      intPart = s.slice(0, lastComma).replace(/\./g, "");
+      fracPart = s.slice(lastComma + 1);
+    }
+  } else if (lastDot >= 0) {
+    // Only dots. Multiple dots → all are thousands separators.
+    const dotCount = (s.match(/\./g) ?? []).length;
+    if (dotCount > 1) {
+      intPart = s.replace(/\./g, "");
+    } else {
+      intPart = s.slice(0, lastDot);
+      fracPart = s.slice(lastDot + 1);
+    }
+  } else if (lastComma >= 0) {
+    // Only commas. Multiple → all are thousands separators.
+    const commaCount = (s.match(/,/g) ?? []).length;
+    if (commaCount > 1) {
+      intPart = s.replace(/,/g, "");
+    } else {
+      // Single comma. Heuristic: if followed by exactly 3 digits at end
+      // and preceded by 1–3 digits, treat as thousands (e.g. "1,234").
+      // Otherwise treat as decimal (e.g. "12,5" → 12.5).
+      const tail = s.slice(lastComma + 1);
+      const headDigits = s.slice(0, lastComma).replace(/[^\d]/g, "");
+      if (
+        tail.length === 3 &&
+        /^\d+$/.test(tail) &&
+        /^\d{1,3}$/.test(headDigits)
+      ) {
+        intPart = s.replace(/,/g, "");
+      } else {
+        intPart = s.slice(0, lastComma);
+        fracPart = tail;
+      }
+    }
+  } else {
+    // No separators at all.
+    intPart = s;
+  }
+
+  // Keep only digits and a leading minus in the integer part.
+  intPart = intPart.replace(/[^\d-]/g, "");
+  fracPart = fracPart.replace(/\D/g, "");
+
+  // Collapse multiple minus signs to a single leading one.
+  if (intPart.startsWith("-")) {
+    intPart = "-" + intPart.replace(/-/g, "");
+  } else {
+    intPart = intPart.replace(/-/g, "");
+  }
+
+  let numeric: string;
+  if (fracPart !== "") {
+    numeric = intPart + "." + fracPart;
+  } else {
+    numeric = intPart;
+  }
+
+  if (numeric === "" || numeric === "-" || numeric === ".") return null;
+
+  const n = Number(numeric);
+  return Number.isFinite(n) ? n : null;
+}
+
+function coerceMonetary(n: number | null): number {
+  if (n === null || !Number.isFinite(n)) return 0;
+  const rounded = Math.round((n + Number.EPSILON) * 100) / 100;
+  if (!Number.isFinite(rounded)) return 0;
+  if (Math.abs(rounded) > 1e12) return 0;
+  return rounded;
+}
+
+function todayInRiyadh(): string {
+  // M7: Saudi Arabia is UTC+3. Compute the business date in Asia/Riyadh
+  // explicitly so a late-night close (00:00–03:00 local) is not attributed
+  // to the previous UTC day.
+  try {
+    const fmt = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Riyadh",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    });
+    return fmt.format(new Date());
+  } catch {
+    const d = new Date(Date.now() + 3 * 60 * 60 * 1000);
+    return d.toISOString().slice(0, 10);
+  }
+}
+
+export default function CashierPage() {
+  const [step, setStep] = useState<Step>(1);
+  const [branches, setBranches] = useState<Branch[]>([]);
+  const [branchesLoading, setBranchesLoading] = useState(true);
+  const [branchesError, setBranchesError] = useState<string | null>(null);
+  const [selectedBranch, setSelectedBranch] = useState<Branch | null>(null);
+  const [isBranchLocked, setIsBranchLocked] = useState(false);
+  const [businessDate, setBusinessDate] = useState<string>(todayInRiyadh());
+  const [fields, setFields] = useState<FinancialFields>({
+    ...EMPTY_FINANCIAL_FIELDS,
+  });
+  // B2: raw string buffer per monetary field. The displayed value comes
+  // from this buffer — never reformatted while the field has focus.
+  const [rawValues, setRawValues] = useState<Record<MonetaryKey, string>>(
+    () => ({ ...EMPTY_RAW_VALUES }),
+  );
+  // O1: cashActualHanded now uses the same rawValues buffer as every other
+  // monetary field. useManualCash controls only the label/affordance and
+  // whether manual_actual_cash is persisted — not which buffer is read.
+  const [useManualCash, setUseManualCash] = useState(false);
+  const [parseErrors, setParseErrors] = useState<Set<MonetaryKey>>(
+    new Set(),
+  );
+  const [zReportImage, setZReportImage] = useState<string | null>(null);
+  const [proofImages, setProofImages] = useState<string[]>([]);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [warnings, setWarnings] = useState<string[]>([]);
+  const [closingId, setClosingId] = useState<string | null>(null);
+  const [saveSource, setSaveSource] = useState<
+    ClosingResult["source"] | null
+  >(null);
+  const pendingBranchRestore = useRef<SavedBranch | null>(null);
+
+  // M3: AI extraction state
+  const [aiExtractedData, setAiExtractedData] = useState<
+    Partial<FinancialFields>
+  >({});
+  const [manuallyModifiedFields, setManuallyModifiedFields] = useState<
+    (keyof FinancialFields)[]
+  >([]);
+  const [aiAnalyzing, setAiAnalyzing] = useState(false);
+  const [aiError, setAiError] = useState<string | null>(null);
+  const [aiNotice, setAiNotice] = useState<string | null>(null);
+
+  // B4: refs to read latest AI state inside clearExtractionState without
+  // stale closures. These MUST be defined before any effect that calls
+  // clearExtractionState so they fire first in a given render cycle.
+  const aiExtractedDataRef = useRef<Partial<FinancialFields>>({});
+  const manuallyModifiedFieldsRef = useRef<(keyof FinancialFields)[]>([]);
+
+  // M6: request versioning + abort for stale AI responses.
+  const aiRequestIdRef = useRef(0);
+  const aiAbortRef = useRef<AbortController | null>(null);
+
+  // Sync refs whenever the state changes.
+  useEffect(() => {
+    aiExtractedDataRef.current = aiExtractedData;
+  }, [aiExtractedData]);
+
+  useEffect(() => {
+    manuallyModifiedFieldsRef.current = manuallyModifiedFields;
+  }, [manuallyModifiedFields]);
+
+  // M3 minor: abort in-flight analyze request and invalidate the request
+  // version on unmount so a late response never writes to unmounted state.
+  useEffect(() => {
+    return () => {
+      if (aiAbortRef.current) {
+        aiAbortRef.current.abort();
+        aiAbortRef.current = null;
+      }
+      aiRequestIdRef.current += 1;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    setBranchesLoading(true);
+    loadBranches()
+      .then((result) => {
+        if (!cancelled) {
+          setBranches(result);
+          setBranchesError(null);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setBranchesError("تعذّر تحميل قائمة الفروع");
+      })
+      .finally(() => {
+        if (!cancelled) setBranchesLoading(false);
+      });
+
+    try {
+      const saved =
+        typeof window !== "undefined"
+          ? window.localStorage.getItem(BRANCH_SESSION_KEY)
+          : null;
+      if (saved) {
+        pendingBranchRestore.current = JSON.parse(saved) as SavedBranch;
+      }
+    } catch {
+      // ignore parse errors
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (
+      branches.length > 0 &&
+      !selectedBranch &&
+      pendingBranchRestore.current
+    ) {
+      const match = branches.find(
+        (b) => b.id === pendingBranchRestore.current!.id,
+      );
+      if (match) {
+        setSelectedBranch(match);
+        setIsBranchLocked(true);
+      }
+      pendingBranchRestore.current = null;
+    }
+  }, [branches, selectedBranch]);
+
+  // O1: single buffer — effectiveActualCash derives from fields.cashActualHanded,
+  // which is kept in sync with rawValues.cashActualHanded by handleFieldChange.
+  const effectiveActualCash = fields.cashActualHanded;
+
+  useEffect(() => {
+    setFields((prev) => ({
+      ...prev,
+      shortageOrExcess: computeShortageOrExcess(
+        effectiveActualCash,
+        prev.cashSystem,
+      ),
+    }));
+  }, [effectiveActualCash, fields.cashSystem]);
+
+  // B4: clear stale extraction state AND reset AI-origin field values
+  // whenever the extraction identity changes (image, branch, date, closing).
+  // Preserve any field the cashier manually modified; clear the rest.
+  const clearExtractionState = useCallback(() => {
+    if (aiAbortRef.current) {
+      aiAbortRef.current.abort();
+      aiAbortRef.current = null;
+    }
+    aiRequestIdRef.current += 1;
+
+    const aiData = aiExtractedDataRef.current;
+    const modified = manuallyModifiedFieldsRef.current;
+    const aiKeys = Object.keys(aiData) as MonetaryKey[];
+
+    if (aiKeys.length > 0) {
+      setFields((prevFields) => {
+        const next = { ...prevFields };
+        for (const key of aiKeys) {
+          if (!modified.includes(key)) {
+            next[key] = 0;
+          }
+        }
+        // O1: shortageOrExcess is owned by the effect above; do not
+        // duplicate the assignment here.
+        return next;
+      });
+      setRawValues((prevRaw) => {
+        const next = { ...prevRaw };
+        for (const key of aiKeys) {
+          if (!modified.includes(key)) {
+            next[key] = "";
+          }
+        }
+        return next;
+      });
+      // Minor: clear stale parse errors for keys being reset so a field
+      // does not keep a stale red border after AI state is cleared.
+      setParseErrors((prev) => {
+        if (prev.size === 0) return prev;
+        const next = new Set(prev);
+        for (const key of aiKeys) {
+          if (!modified.includes(key)) {
+            next.delete(key);
+          }
+        }
+        return next;
+      });
+    }
+
+    setAiExtractedData({});
+    setManuallyModifiedFields([]);
+    setAiAnalyzing(false);
+    setAiError(null);
+    setAiNotice(null);
+  }, []);
+
+  useEffect(() => {
+    clearExtractionState();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedBranch?.id]);
+
+  useEffect(() => {
+    clearExtractionState();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [businessDate]);
+
+  const handlePickBranch = (branch: Branch) => {
+    setSelectedBranch(branch);
+    setIsBranchLocked(true);
+    try {
+      window.localStorage.setItem(
+        BRANCH_SESSION_KEY,
+        JSON.stringify({
+          id: branch.id,
+          name: branch.name,
+        } satisfies SavedBranch),
+      );
+    } catch {
+      // ignore quota / privacy errors
+    }
+  };
+
+  const resetInputs = () => {
+    setFields({ ...EMPTY_FINANCIAL_FIELDS });
+    setRawValues({ ...EMPTY_RAW_VALUES });
+    setUseManualCash(false);
+    setParseErrors(new Set());
+    setZReportImage(null);
+    setProofImages([]);
+    setSaveError(null);
+    setWarnings([]);
+    setClosingId(null);
+    setSaveSource(null);
+    clearExtractionState();
+  };
+
+  const handleConfirmBranchChange = () => {
+    if (window.confirm("تغيير الفرع؟ سيتم فقدان البيانات المدخلة.")) {
+      setSelectedBranch(null);
+      setIsBranchLocked(false);
+      setStep(1);
+      resetInputs();
+      try {
+        window.localStorage.removeItem(BRANCH_SESSION_KEY);
+      } catch {
+        // ignore
+      }
+    }
+  };
+
+  const handleStartNewClosing = () => {
+    setStep(1);
+    resetInputs();
+  };
+
+  // B2: update the raw string buffer and the parsed numeric state together.
+  // The cashier sees exactly what they type; parsing happens on every
+  // keystroke for live computation but the display is never reformatted.
+  const handleFieldChange = (key: MonetaryKey, raw: string) => {
+    if (
+      Object.keys(aiExtractedData).length > 0 &&
+      !manuallyModifiedFields.includes(key)
+    ) {
+      setManuallyModifiedFields((prev) => [...prev, key]);
+    }
+    setRawValues((prev) => ({ ...prev, [key]: raw }));
+    const parsed = parseLocalizedNumber(raw);
+    setFields((prev) => ({
+      ...prev,
+      [key]: parsed !== null ? coerceMonetary(parsed) : 0,
+    }));
+    // Minor: treat a lone "-" or "." as incomplete (no error), not invalid,
+    // so the hint does not flash mid-typing.
+    const trimmed = raw.trim();
+    const isPartialInput = trimmed === "-" || trimmed === ".";
+    setParseErrors((prev) => {
+      const hasError =
+        trimmed !== "" && parsed === null && !isPartialInput;
+      if (hasError && !prev.has(key)) {
+        const next = new Set(prev);
+        next.add(key);
+        return next;
+      }
+      if (!hasError && prev.has(key)) {
+        const next = new Set(prev);
+        next.delete(key);
+        return next;
+      }
+      return prev;
+    });
+  };
+
+  const onZReport = (file?: File) => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      clearExtractionState();
+      setZReportImage(reader.result as string);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const onProofs = (files: FileList | null) => {
+    if (!files) return;
+    Array.from(files).forEach((file) => {
+      const reader = new FileReader();
+      reader.onload = () =>
+        setProofImages((prev) => [...prev, reader.result as string]);
+      reader.readAsDataURL(file);
+    });
+  };
+
+  const handleAnalyzeImage = useCallback(async () => {
+    if (!zReportImage) return;
+
+    if (aiAbortRef.current) {
+      aiAbortRef.current.abort();
+    }
+    const controller = new AbortController();
+    aiAbortRef.current = controller;
+    const requestId = ++aiRequestIdRef.current;
+
+    setAiAnalyzing(true);
+    setAiError(null);
+    setAiNotice(null);
+    try {
+      const res = await fetch("/api/analyze-closing-image", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ imageBase64: zReportImage }),
+        signal: controller.signal,
+      });
+      const data = (await res.json().catch(() => null)) as {
+        error?: string;
+        fields?: Partial<FinancialFields>;
+        finishReason?: string | null;
+        model?: string;
+      } | null;
+
+      if (requestId !== aiRequestIdRef.current) return;
+
+      if (!res.ok || !data) {
+        const msg =
+          data?.error ?? "تعذّر تحليل الصورة. يُرجى إدخال البيانات يدويًا.";
+        setAiError(msg);
+        return;
+      }
+
+      const extracted: Partial<FinancialFields> = data.fields ?? {};
+
+      // O2: Reconcile against prior extraction. Clear any key that was
+      // AI-origin in the previous extraction but is absent from the new
+      // one — unless the cashier manually modified it. This prevents
+      // stale AI values from persisting with no badge and no way for
+      // later clearing logic to identify them as AI-origin.
+      const priorAiKeys = Object.keys(
+        aiExtractedDataRef.current,
+      ) as MonetaryKey[];
+      const modified = [...manuallyModifiedFieldsRef.current];
+      const staleKeys = priorAiKeys.filter(
+        (k) => !(k in extracted) && !modified.includes(k),
+      );
+
+      setAiExtractedData(extracted);
+      // Minor: retain manually-modified keys that are preserved under O2
+      // (modified but absent from new extraction). Keys present in the new
+      // extraction are freshly AI-set and should show the "ai" badge.
+      const preservedModified = modified.filter(
+        (k) => !(k in extracted),
+      );
+      setManuallyModifiedFields(preservedModified);
+      setFields((prev) => {
+        const next: FinancialFields = { ...prev };
+        // O2: clear stale AI keys absent from new extraction.
+        for (const key of staleKeys) {
+          next[key] = 0;
+        }
+        // Apply new extraction values (overwrites stale clears where
+        // the key is present in both).
+        for (const key of AI_EXTRACTABLE_FIELDS) {
+          const v = extracted[key];
+          if (typeof v === "number" && Number.isFinite(v)) {
+            next[key] = coerceMonetary(v);
+          }
+        }
+        next.shortageOrExcess = computeShortageOrExcess(
+          next.cashActualHanded,
+          next.cashSystem,
+        );
+        return next;
+      });
+      // B2: also update raw string buffers so displayed values match.
+      setRawValues((prev) => {
+        const next = { ...prev };
+        for (const key of staleKeys) {
+          next[key] = "";
+        }
+        for (const key of AI_EXTRACTABLE_FIELDS) {
+          const v = extracted[key];
+          if (typeof v === "number" && Number.isFinite(v)) {
+            // M3 minor: render AI-extracted 0 as "0" so the field
+            // displays correctly instead of appearing empty.
+            next[key] = String(coerceMonetary(v));
+          }
+        }
+        return next;
+      });
+      // Minor: clear parse errors for keys overwritten or cleared by AI
+      // so a field does not keep a stale red border after a correct value.
+      setParseErrors((prev) => {
+        if (prev.size === 0) return prev;
+        const next = new Set(prev);
+        for (const key of AI_EXTRACTABLE_FIELDS) {
+          if (typeof extracted[key] === "number") {
+            next.delete(key);
+          }
+        }
+        for (const key of staleKeys) {
+          next.delete(key);
+        }
+        return next;
+      });
+      const filled = AI_EXTRACTABLE_FIELDS.filter(
+        (k) => typeof extracted[k] === "number",
+      ).length;
+      setAiNotice(
+        filled > 0
+          ? `تمت تعبئة ${filled} حقل من تحليل الصورة. يمكنك مراجعتها وتعديلها.`
+          : "لم يستطع النموذج استخراج قيم واضحة. يُرجى الإدخال يدويًا.",
+      );
+    } catch (e) {
+      if ((e as Error)?.name === "AbortError") return;
+      if (requestId !== aiRequestIdRef.current) return;
+      setAiError(
+        e instanceof Error
+          ? e.message
+          : "تعذّر تحليل الصورة. يُرجى إدخال البيانات يدويًا.",
+      );
+    } finally {
+      if (requestId === aiRequestIdRef.current) {
+        setAiAnalyzing(false);
+        if (aiAbortRef.current === controller) aiAbortRef.current = null;
+      }
+    }
+  }, [zReportImage]);
+
+  const badgeFor = (key: keyof FinancialFields): FieldBadge => {
+    if (manuallyModifiedFields.includes(key)) return "manual";
+    if (
+      Object.keys(aiExtractedData).length > 0 &&
+      typeof aiExtractedData[key] === "number"
+    ) {
+      return "ai";
+    }
+    return null;
+  };
+
+  const handleSave = useCallback(async () => {
+    if (!selectedBranch) return;
+    if (saving) return;
+    // S1: block save while any field has an unparseable value.
+    if (parseErrors.size > 0) {
+      setSaveError("صحّح القيم غير الصحيحة قبل الحفظ.");
+      return;
+    }
+
+    setSaving(true);
+    setSaveError(null);
+    setWarnings([]);
+    try {
+      const dup = await checkDuplicateClosing(
+        selectedBranch.id,
+        businessDate,
+      );
+      if (dup) {
+        const ok = window.confirm(
+          "يوجد إقفال لهذا الفرع في هذا التاريخ. هل تريد المتابعة؟",
+        );
+        if (!ok) {
+          setSaving(false);
+          return;
+        }
+      }
+
+      const reviewedData: FinancialFields = {
+        ...fields,
+        shortageOrExcess: computeShortageOrExcess(
+          effectiveActualCash,
+          fields.cashSystem,
+        ),
+      };
+
+      // O1: manualActualCash derives from the same single buffer
+      // (rawValues.cashActualHanded). useManualCash controls only
+      // whether this value is persisted as manual_actual_cash.
+      const manualActualCash =
+        useManualCash && rawValues.cashActualHanded !== ""
+          ? coerceMonetary(parseLocalizedNumber(rawValues.cashActualHanded))
+          : undefined;
+
+      const result = await saveClosing({
+        branchId: selectedBranch.id,
+        businessDate,
+        reviewedData,
+        manualActualCash,
+        zReportImageUrl: zReportImage ?? undefined,
+        paymentProofImageUrls:
+          proofImages.length > 0 ? proofImages : undefined,
+        aiExtractedData:
+          Object.keys(aiExtractedData).length > 0 ? aiExtractedData : undefined,
+        manuallyModifiedFields:
+          manuallyModifiedFields.length > 0
+            ? manuallyModifiedFields
+            : undefined,
+      });
+      setClosingId(result.closing.id);
+      setSaveSource(result.source);
+      setWarnings(result.warnings);
+      setStep(3);
+    } catch (e) {
+      setSaveError(
+        e instanceof Error ? e.message : "حدث خطأ أثناء الحفظ",
+      );
+    } finally {
+      setSaving(false);
+    }
+  }, [
+    selectedBranch,
+    businessDate,
+    fields,
+    useManualCash,
+    rawValues,
+    effectiveActualCash,
+    zReportImage,
+    proofImages,
+    aiExtractedData,
+    manuallyModifiedFields,
+    saving,
+    parseErrors,
+  ]);
+
+  return (
+    <main className="mx-auto max-w-3xl px-4 py-10" dir="rtl">
+      <Link
+        href="/"
+        className="mb-6 inline-flex items-center gap-1 text-sm text-slate-600 hover:text-slate-900"
+      >
+        <ArrowRight className="h-4 w-4" />
+        العودة للرئيسية
+      </Link>
+      <div className="card-frame p-6">
+        <div className="mb-6 flex items-center gap-3">
+          <Calculator className="h-8 w-8 text-emerald-600" />
+          <h1 className="text-2xl font-bold">شاشة الكاشير</h1>
+        </div>
+        <div className="mb-6 flex items-center justify-center gap-2">
+          {([1, 2, 3] as const).map((s) => (
+            <div
+              key={s}
+              className={`flex h-8 w-8 items-center justify-center rounded-full text-sm font-bold ${
+                step >= s
+                  ? "bg-emerald-600 text-white"
+                  : "bg-slate-200 text-slate-500"
+              }`}
+            >
+              {s}
+            </div>
+          ))}
+        </div>
+
+        {/* Step 1 */}
+        {step === 1 && (
+          <div className="space-y-5">
+            <h2 className="text-lg font-semibold">
+              الخطوة ١: اختيار الفرع والتاريخ
+            </h2>
+            {/* Branch */}
+            <div>
+              <label className="mb-1 block text-sm font-medium text-slate-700">
+                الفرع
+              </label>
+              {branchesLoading ? (
+                <p className="text-sm text-slate-500">جارٍ تحميل الفروع…</p>
+              ) : branchesError ? (
+                <p className="text-sm text-red-600">{branchesError}</p>
+              ) : !isBranchLocked ? (
+                <select
+                  className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
+                  value={selectedBranch?.id ?? ""}
+                  onChange={(e) => {
+                    const b = branches.find(
+                      (x) => x.id === e.target.value,
+                    );
+                    if (b) handlePickBranch(b);
+                  }}
+                >
+                  <option value="">— اختر الفرع —</option>
+                  {branches.map((b) => (
+                    <option key={b.id} value={b.id}>
+                      {b.id} — {b.name}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <div className="flex items-center gap-2 rounded-md bg-slate-100 px-3 py-2">
+                  <Lock className="h-4 w-4 text-slate-500" />
+                  <span className="text-sm font-medium">
+                    {selectedBranch?.id} — {selectedBranch?.name}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={handleConfirmBranchChange}
+                    className="mr-auto text-xs text-emerald-600 hover:underline"
+                  >
+                    تغيير الفرع
+                  </button>
+                </div>
+              )}
+            </div>
+            {/* Date */}
+            <div>
+              <label className="mb-1 block text-sm font-medium text-slate-700">
+                تاريخ العمل
+              </label>
+              <input
+                type="date"
+                className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
+                value={businessDate}
+                onChange={(e) => setBusinessDate(e.target.value)}
+              />
+            </div>
+            {/* Z-Report image */}
+            <div>
+              <label className="mb-1 block text-sm font-medium text-slate-700">
+                صورة تقرير Z (اختياري)
+              </label>
+              <input
+                type="file"
+                accept={ACCEPTED_IMAGE_TYPES}
+                onChange={(e) => onZReport(e.target.files?.[0])}
+                className="block w-full text-sm"
+              />
+              {zReportImage && (
+                /* eslint-disable-next-line @next/next/no-img-element */
+                <img
+                  src={zReportImage}
+                  alt="Z-Report"
+                  className="mt-2 max-h-48 rounded border"
+                />
+              )}
+            </div>
+            {/* Payment proofs */}
+            <div>
+              <label className="mb-1 block text-sm font-medium text-slate-700">
+                صور إثبات الدفع (اختياري)
+              </label>
+              <input
+                type="file"
+                accept={ACCEPTED_IMAGE_TYPES}
+                multiple
+                onChange={(e) => onProofs(e.target.files)}
+                className="block w-full text-sm"
+              />
+              {proofImages.length > 0 && (
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {proofImages.map((img, i) => (
+                    /* eslint-disable-next-line @next/next/no-img-element */
+                    <img
+                      key={i}
+                      src={img}
+                      alt={`Proof ${i + 1}`}
+                      className="h-24 rounded border"
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+            <button
+              type="button"
+              className="w-full rounded-md bg-emerald-600 px-4 py-2 font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+              disabled={!selectedBranch || !businessDate}
+              onClick={() => setStep(2)}
+            >
+              التالي
+            </button>
+          </div>
+        )}
+
+        {/* Step 2 */}
+        {step === 2 && (
+          <div className="space-y-4">
+            <h2 className="text-lg font-semibold">
+              الخطوة ٢: البيانات المالية
+            </h2>
+
+            {/* M3: AI analysis button */}
+            <div className="rounded-md border border-violet-200 bg-violet-50 p-3">
+              <div className="flex items-center gap-2">
+                <Sparkles className="h-4 w-4 text-violet-600" />
+                <span className="text-sm font-medium text-violet-900">
+                  تحليل بالذكاء الاصطناعي
+                </span>
+              </div>
+              <p className="mt-1 text-xs text-violet-800">
+                يستخرج القيم من صورة تقرير Z تلقائيًا. يمكنك دائمًا تعديل أي قيمة بعد الاستخراج.
+              </p>
+              <button
+                type="button"
+                onClick={handleAnalyzeImage}
+                disabled={!zReportImage || aiAnalyzing}
+                className="mt-2 inline-flex w-full items-center justify-center gap-2 rounded-md bg-violet-600 px-4 py-2 text-sm font-medium text-white hover:bg-violet-700 disabled:opacity-50"
+              >
+                {aiAnalyzing ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    جارٍ التحليل…
+                  </>
+                ) : (
+                  <>
+                    <Sparkles className="h-4 w-4" />
+                    تحليل صورة تقرير Z
+                  </>
+                )}
+              </button>
+              {!zReportImage && (
+                <p className="mt-1 text-xs text-violet-700">
+                  عُد للخطوة السابقة لرفع صورة تقرير Z أولًا.
+                </p>
+              )}
+              {aiNotice && (
+                <p className="mt-2 text-xs font-medium text-violet-900">
+                  {aiNotice}
+                </p>
+              )}
+              {aiError && (
+                <div className="mt-2 flex items-start gap-2 rounded bg-red-50 p-2 text-xs text-red-700">
+                  <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                  <span>{aiError}</span>
+                </div>
+              )}
+            </div>
+
+            <NumberInput
+              label="إجمالي المبيعات"
+              value={rawValues.grossSales}
+              onChange={(v) => handleFieldChange("grossSales", v)}
+              badge={badgeFor("grossSales")}
+              error={parseErrors.has("grossSales")}
+            />
+            <NumberInput
+              label="صافي المبيعات"
+              value={rawValues.netSales}
+              onChange={(v) => handleFieldChange("netSales", v)}
+              badge={badgeFor("netSales")}
+              error={parseErrors.has("netSales")}
+            />
+            <NumberInput
+              label="النقدية حسب النظام"
+              value={rawValues.cashSystem}
+              onChange={(v) => handleFieldChange("cashSystem", v)}
+              badge={badgeFor("cashSystem")}
+              error={parseErrors.has("cashSystem")}
+            />
+            {/* O1: Manual actual cash uses the same rawValues.cashActualHanded
+                buffer as the non-manual path. useManualCash controls only the
+                label and whether manual_actual_cash is persisted on save. */}
+            <div className="rounded-md border border-slate-200 p-3">
+              <label className="flex items-center gap-2 text-sm font-medium">
+                <input
+                  type="checkbox"
+                  checked={useManualCash}
+                  onChange={(e) => setUseManualCash(e.target.checked)}
+                />
+                إدخال النقدية الفعلية يدويًا
+              </label>
+              {useManualCash ? (
+                <NumberInput
+                  label="النقدية الفعلية"
+                  value={rawValues.cashActualHanded}
+                  onChange={(v) => handleFieldChange("cashActualHanded", v)}
+                  badge={badgeFor("cashActualHanded")}
+                  error={parseErrors.has("cashActualHanded")}
+                />
+              ) : (
+                <div className="mt-2">
+                  <NumberInput
+                    label="النقدية المسلّمة"
+                    value={rawValues.cashActualHanded}
+                    onChange={(v) => handleFieldChange("cashActualHanded", v)}
+                    badge={badgeFor("cashActualHanded")}
+                    error={parseErrors.has("cashActualHanded")}
+                  />
+                </div>
+              )}
+            </div>
+            <NumberInput
+              label="سبان"
+              value={rawValues.spanSystem}
+              onChange={(v) => handleFieldChange("spanSystem", v)}
+              badge={badgeFor("spanSystem")}
+              error={parseErrors.has("spanSystem")}
+            />
+            <NumberInput
+              label="تطبيقات التوصيل"
+              value={rawValues.deliveryAppsSystem}
+              onChange={(v) => handleFieldChange("deliveryAppsSystem", v)}
+              badge={badgeFor("deliveryAppsSystem")}
+              error={parseErrors.has("deliveryAppsSystem")}
+            />
+            <NumberInput
+              label="حركات مرتجعة"
+              value={rawValues.reversedTransactions}
+              onChange={(v) => handleFieldChange("reversedTransactions", v)}
+              badge={badgeFor("reversedTransactions")}
+              error={parseErrors.has("reversedTransactions")}
+            />
+            {/* Shortage/excess display */}
+            <div className="rounded-md bg-slate-50 p-3">
+              <div className="flex items-center justify-between">
+                <span className="text-sm font-medium">
+                  العجز / الزيادة
+                </span>
+                <span
+                  className={`text-lg font-bold ${
+                    fields.shortageOrExcess < 0
+                      ? "text-red-600"
+                      : fields.shortageOrExcess > 0
+                        ? "text-emerald-600"
+                        : "text-slate-500"
+                  }`}
+                >
+                  {fields.shortageOrExcess.toFixed(2)} ر.س
+                </span>
+              </div>
+            </div>
+            {saveError && (
+              <div className="flex items-center gap-2 rounded-md bg-red-50 p-3 text-sm text-red-700">
+                <AlertCircle className="h-4 w-4 shrink-0" />
+                {saveError}
+              </div>
+            )}
+            {parseErrors.size > 0 && (
+              <p className="text-center text-xs text-red-600">
+                صحّح القيم غير الصحيحة قبل الحفظ
+              </p>
+            )}
+            <div className="flex gap-2">
+              <button
+                type="button"
+                className="flex-1 rounded-md border border-slate-300 px-4 py-2 font-medium text-slate-700 hover:bg-slate-50"
+                onClick={() => setStep(1)}
+              >
+                السابق
+              </button>
+              <button
+                type="button"
+                className="flex-1 rounded-md bg-emerald-600 px-4 py-2 font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+                disabled={saving || parseErrors.size > 0}
+                onClick={handleSave}
+              >
+                {saving ? "جارٍ الحفظ…" : "حفظ الإقفال"}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Step 3 */}
+        {step === 3 && closingId && (
+          <div className="space-y-5 text-center">
+            <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-emerald-100">
+              <Check className="h-8 w-8 text-emerald-600" />
+            </div>
+            <h2 className="text-xl font-bold">تم إنشاء الإقفال</h2>
+            <p className="text-sm text-slate-600">
+              رقم الإقفال:{" "}
+              <span className="font-mono font-bold">{closingId}</span>
+            </p>
+            {saveSource === "local-queued" && (
+              <div className="rounded-md bg-amber-50 p-3">
+                <p className="text-sm font-medium text-amber-800">
+                  تم الحفظ محليًا (وضع عدم الاتصال). يُرجى إعادة الإرسال يدويًا عند توفّر الاتصال.
+                </p>
+              </div>
+            )}
+            {warnings.length > 0 && (
+              <div className="rounded-md bg-amber-50 p-3 text-right">
+                <p className="mb-1 text-xs font-semibold text-amber-900">
+                  تنبيهات:
+                </p>
+                <ul className="space-y-1 text-sm text-amber-800">
+                  {warnings.map((w, i) => (
+                    <li key={i}>• {w}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {saveSource !== "local-queued" && warnings.length === 0 && (
+              <div className="rounded-md bg-amber-50 p-3">
+                <p className="text-sm font-medium text-amber-800">
+                  بانتظار اعتماد الإدارة المالية
+                </p>
+              </div>
+            )}
+            <div className="flex flex-wrap justify-center gap-2">
+              <button
+                type="button"
+                onClick={handleStartNewClosing}
+                className="inline-flex items-center gap-2 rounded-md border border-slate-300 px-4 py-2 font-medium text-slate-700 hover:bg-slate-50"
+              >
+                <RotateCcw className="h-4 w-4" />
+                بدء إقفال جديد
+              </button>
+              <Link
+                href="/"
+                className="inline-block rounded-md bg-emerald-600 px-4 py-2 font-medium text-white hover:bg-emerald-700"
+              >
+                العودة للرئيسية
+              </Link>
+            </div>
+          </div>
+        )}
+      </div>
+    </main>
+  );
+}
+
+function FieldBadgePill({ kind }: { kind: "ai" | "manual" }) {
+  if (kind === "ai") {
+    return (
+      <span className="rounded bg-violet-100 px-1.5 py-0.5 text-[10px] font-semibold text-violet-700">
+        ذكاء اصطناعي
+      </span>
+    );
+  }
+  return (
+    <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold text-amber-700">
+      معدّل يدويًا
+    </span>
+  );
+}
+
+function NumberInput({
+  label,
+  value,
+  onChange,
+  badge,
+  error,
+}: {
+  label: string;
+  value: string;
+  onChange: (val: string) => void;
+  badge?: FieldBadge;
+  error?: boolean;
+}) {
+  return (
+    <div>
+      <label className="mb-1 flex items-center gap-2 text-sm font-medium text-slate-700">
+        <span>{label}</span>
+        {badge && <FieldBadgePill kind={badge} />}
+      </label>
+      <input
+        type="text"
+        inputMode="decimal"
+        className={`w-full rounded-md border px-3 py-2 text-sm ${
+          error ? "border-red-400" : "border-slate-300"
+        }`}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+      />
+      {error && (
+        <p className="mt-1 text-xs text-red-600">
+          قيمة غير صحيحة
+        </p>
+      )}
+    </div>
+  );
+}
+===ENDFILE===
+===FILE: app/lib/closings.ts===
+import { getSupabase, isSupabaseConfigured } from "./supabase";
+import {
+  DailyClosing,
+  FieldConfidence,
+  FinancialFields,
+} from "../types";
+
+const QUEUE_KEY = "cashier_offline_closings_queue";
+const PENDING_UPLOADS_KEY = "cashier_pending_uploads";
+// C1 + M1: the ONLY bucket that exists is `closing-images` (private, created
+// by migration 003). Do NOT create new buckets. Z-reports and payment proofs
+// are separated by path prefix under the same bucket.
+const CLOSING_IMAGES_BUCKET = "closing-images";
+const SIGNED_URL_EXPIRY_SECONDS = 300; // 5 minutes
+
+// Align with migration 003 allowed_mime_types. GIF is rejected by the bucket
+// and would always fail on upload.
+const ALLOWED_IMAGE_MIME_TYPES = [
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/heic",
+];
+
+export interface SaveClosingInput {
+  branchId: string;
+  businessDate: string;
+  reviewedData: FinancialFields;
+  manualActualCash?: number;
+  zReportImageUrl?: string;
+  paymentProofImageUrls?: string[];
+  aiExtractedData?: Partial<FinancialFields>;
+  aiConfidence?: FieldConfidence;
+  manuallyModifiedFields?: (keyof FinancialFields)[];
+}
+
+export interface ClosingResult {
+  closing: DailyClosing;
+  source: "supabase" | "local-queued";
+  warnings: string[];
+}
+
+interface PendingUpload {
+  closingId: string;
+  type: "z_report" | "payment_proof";
+  dataUrl: string;
+  createdAt: string;
+}
+
+function dataUrlToBytes(
+  dataUrl: string,
+): { bytes: Uint8Array; mime: string; ext: string } | null {
+  const m = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
+  if (!m) return null;
+  const mime = m[1];
+  // Reject MIME types the storage bucket does not allow.
+  if (!ALLOWED_IMAGE_MIME_TYPES.includes(mime)) return null;
+  const base64 = m[2];
+  let ext = "jpg";
+  if (mime === "image/png") ext = "png";
+  else if (mime === "image/webp") ext = "webp";
+  else if (mime === "image/heic") ext = "heic";
+  try {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return { bytes, mime, ext };
+  } catch {
+    return null;
+  }
+}
+
+function genId(): string {
+  return `close-${Date.now()}`;
+}
+
+function readQueue(): SaveClosingInput[] {
+  try {
+    const raw = localStorage.getItem(QUEUE_KEY);
+    return raw ? (JSON.parse(raw) as SaveClosingInput[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeQueue(items: SaveClosingInput[]): boolean {
+  try {
+    localStorage.setItem(QUEUE_KEY, JSON.stringify(items));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readPendingUploads(): PendingUpload[] {
+  try {
+    const raw = localStorage.getItem(PENDING_UPLOADS_KEY);
+    return raw ? (JSON.parse(raw) as PendingUpload[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function writePendingUploads(items: PendingUpload[]): boolean {
+  try {
+    localStorage.setItem(PENDING_UPLOADS_KEY, JSON.stringify(items));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function pushPendingUpload(entry: PendingUpload): boolean {
+  const items = readPendingUploads();
+  items.push(entry);
+  return writePendingUploads(items);
+}
+
+function legacyDuplicateKey(branchId: string, businessDate: string): string {
+  return `closing_${branchId}_${businessDate}`;
+}
+
+function localHasClosing(
+  branchId: string,
+  businessDate: string,
+): boolean {
+  try {
+    if (localStorage.getItem(legacyDuplicateKey(branchId, businessDate))) {
+      return true;
+    }
+  } catch {
+    // ignore storage access errors
+  }
+  return readQueue().some(
+    (c) => c.branchId === branchId && c.businessDate === businessDate,
+  );
+}
+
+function markLocalClosing(
+  branchId: string,
+  businessDate: string,
+): void {
+  try {
+    localStorage.setItem(legacyDuplicateKey(branchId, businessDate), "1");
+  } catch {
+    // best-effort
+  }
+}
+
+export async function checkDuplicateClosing(
+  branchId: string,
+  businessDate: string,
+): Promise<boolean> {
+  if (isSupabaseConfigured) {
+    try {
+      const supabase = getSupabase();
+      const { data, error } = await supabase
+        .from("daily_closings")
+        .select("id")
+        .eq("branch_id", branchId)
+        .eq("business_date", businessDate)
+        .maybeSingle();
+      if (!error) {
+        if (data) return true;
+        return localHasClosing(branchId, businessDate);
+      }
+    } catch {
+      // fall through to local-only check
+    }
+  }
+  return localHasClosing(branchId, businessDate);
+}
+
+// B5: resolve a stored image value to a viewable URL. The column holds two
+// possible representations:
+//   - Legacy (M2): full public URLs from getPublicUrl() — the bucket is now
+//     private so those URLs return 400. Where the URL contains
+//     /closing-images/, extract the object path and sign it.
+//   - New (M3): object paths within the closing-images bucket — generate a
+//     short-lived signed URL via createSignedUrl.
+// Never returns an unchecked string; always checks createSignedUrl's error.
+export async function resolveImageUrl(
+  storedValue: string | null | undefined,
+): Promise<string | null> {
+  if (!storedValue) return null;
+
+  let objectPath: string;
+
+  if (
+    storedValue.startsWith("http://") ||
+    storedValue.startsWith("https://")
+  ) {
+    // Legacy rows from applied M2 code store absolute getPublicUrl() URLs.
+    // The bucket is now private, so those URLs return 400. Extract the
+    // object path from the URL and sign it.
+    const prefix = "/closing-images/";
+    const idx = storedValue.indexOf(prefix);
+    if (idx < 0) return null;
+    objectPath = storedValue.slice(idx + prefix.length);
+    if (!objectPath) return null;
+  } else {
+    // New rows store object paths directly.
+    objectPath = storedValue;
+  }
+
+  if (!isSupabaseConfigured) return null;
+
+  try {
+    const supabase = getSupabase();
+    const { data, error } = await supabase.storage
+      .from(CLOSING_IMAGES_BUCKET)
+      .createSignedUrl(objectPath, SIGNED_URL_EXPIRY_SECONDS);
+
+    if (error || !data?.signedUrl) {
+      console.error(
+        "[closings] createSignedUrl failed",
+        error?.message,
+      );
+      return null;
+    }
+
+    return data.signedUrl;
+  } catch {
+    return null;
+  }
+}
+
+export async function resolveImageUrls(
+  storedValues: string[] | null | undefined,
+): Promise<string[]> {
+  if (!storedValues || storedValues.length === 0) return [];
+  const results = await Promise.all(
+    storedValues.map((v) => resolveImageUrl(v)),
+  );
+  return results.filter((url): url is string => url !== null);
+}
+
+interface UploadOutcome {
+  path: string | null;
+  warning: string | null;
+}
+
+async function tryUploadImage(
+  dataUrl: string,
+  pathPrefix: string,
+  closingId: string,
+  type: "z_report" | "payment_proof",
+): Promise<UploadOutcome> {
+  const parsed = dataUrlToBytes(dataUrl);
+  if (!parsed) {
+    // Do not queue a malformed or rejected-MIME data URL — it can never
+    // decode later and only wastes storage quota.
+    return {
+      path: null,
+      warning:
+        type === "z_report"
+          ? "صورة تقرير Z غير صالحة أو بصيغة غير مدعومة. يُرجى إعادة رفع الصورة."
+          : "إحدى صور الإثبات غير صالحة أو بصيغة غير مدعومة. يُرجى إعادة رفع الصورة.",
+    };
+  }
+
+  // Offline / unconfigured: try to retain the image locally so it is
+  // not lost. The pending-uploads queue is the only fallback.
+  if (!isSupabaseConfigured) {
+    const queued = pushPendingUpload({
+      closingId,
+      type,
+      dataUrl,
+      createdAt: new Date().toISOString(),
+    });
+    if (!queued) {
+      return {
+        path: null,
+        warning:
+          type === "z_report"
+            ? "تعذّر حفظ صورة تقرير Z على هذا الجهاز (مساحة التخزين ممتلئة). يُرجى إعادة رفع الصورة."
+            : "تعذّر حفظ إحدى صور الإثبات على هذا الجهاز (مساحة التخزين ممتلئة). يُرجى إعادة رفع الصورة.",
+      };
+    }
+    return { path: null, warning: null };
+  }
+
+  const objectPath = `${pathPrefix}/${Date.now()}-${Math.random()
+    .toString(36)
+    .slice(2)}.${parsed.ext}`;
+  try {
+    const supabase = getSupabase();
+    const { data, error } = await supabase.storage
+      .from(CLOSING_IMAGES_BUCKET)
+      .upload(objectPath, parsed.bytes, {
+        contentType: parsed.mime,
+        upsert: false,
+      });
+    if (error || !data) {
+      const queued = pushPendingUpload({
+        closingId,
+        type,
+        dataUrl,
+        createdAt: new Date().toISOString(),
+      });
+      if (!queued) {
+        return {
+          path: null,
+          warning:
+            type === "z_report"
+              ? "تعذّر رفع صورة تقرير Z ولم يتم حفظها على هذا الجهاز (مساحة التخزين ممتلئة). يُرجى إعادة رفع الصورة."
+              : "تعذّر رفع إحدى صور الإثبات ولم يتم حفظها على هذا الجهاز (مساحة التخزين ممتلئة). يُرجى إعادة رفع الصورة.",
+        };
+      }
+      return {
+        path: null,
+        warning:
+          type === "z_report"
+            ? "تعذّر رفع صورة تقرير Z. تم حفظها على هذا الجهاز فقط ويُرجى إعادة رفعها لاحقًا."
+            : "تعذّر رفع إحدى صور الإثبات. تم حفظها على هذا الجهاز فقط ويُرجى إعادة رفعها لاحقًا.",
+      };
+    }
+    // M1: persist the object PATH returned by Supabase, not a public URL.
+    return { path: data.path, warning: null };
+  } catch {
+    const queued = pushPendingUpload({
+      closingId,
+      type,
+      dataUrl,
+      createdAt: new Date().toISOString(),
+    });
+    if (!queued) {
+      return {
+        path: null,
+        warning:
+          type === "z_report"
+            ? "تعذّر رفع صورة تقرير Z ولم يتم حفظها على هذا الجهاز (مساحة التخزين ممتلئة). يُرجى إعادة رفع الصورة."
+            : "تعذّر رفع إحدى صور الإثبات ولم يتم حفظها على هذا الجهاز (مساحة التخزين ممتلئة). يُرجى إعادة رفع الصورة.",
+      };
+    }
+    return {
+      path: null,
+      warning:
+        type === "z_report"
+          ? "تعذّر رفع صورة تقرير Z. تم حفظها على هذا الجهاز فقط ويُرجى إعادة رفعها لاحقًا."
+          : "تعذّر رفع إحدى صور الإثبات. تم حفظها على هذا الجهاز فقط ويُرجى إعادة رفعها لاحقًا.",
+    };
+  }
+}
+
+function isOnline(): boolean {
+  if (typeof navigator === "undefined") return true;
+  return navigator.onLine !== false;
+}
+
+export async function saveClosing(
+  input: SaveClosingInput,
+): Promise<ClosingResult> {
+  const id = genId();
+  const warnings: string[] = [];
+  const now = new Date().toISOString();
+
+  const baseClosing: DailyClosing = {
+    id,
+    branchId: input.branchId,
+    businessDate: input.businessDate,
+    status: "pending",
+    reviewedData: { ...input.reviewedData },
+    manualActualCash: input.manualActualCash,
+    aiExtractedData: input.aiExtractedData,
+    aiConfidence: input.aiConfidence,
+    manuallyModifiedFields: input.manuallyModifiedFields,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  // B3: offline branch. Never let image bytes block a closing from being
+  // saved. A multi-megabyte data URL can exhaust the ~5 MB localStorage
+  // quota and prevent ALL closings from being recorded offline. The
+  // closing itself is a few hundred bytes and must always be retained.
+  if (!isSupabaseConfigured || !isOnline()) {
+    const queue = readQueue();
+    const hasImages =
+      !!input.zReportImageUrl ||
+      (!!input.paymentProofImageUrls &&
+        input.paymentProofImageUrls.length > 0);
+
+    // First attempt: include the full payload (small images may fit).
+    queue.push({ ...input });
+    let persisted = writeQueue(queue);
+    let imagesStripped = false;
+
+    if (!persisted && hasImages) {
+      // Retry: strip image data URLs. They are the likely cause of the
+      // quota failure. The closing data itself is tiny.
+      const stripped: SaveClosingInput = { ...input };
+      stripped.zReportImageUrl = undefined;
+      stripped.paymentProofImageUrls = undefined;
+      queue[queue.length - 1] = stripped;
+      persisted = writeQueue(queue);
+      if (persisted) {
+        imagesStripped = true;
+      }
+    }
+
+    if (!persisted) {
+      throw new Error(
+        "تعذّر الحفظ محليًا (مساحة التخزين ممتلئة). يُرجى تحرير مساحة أو المحاولة مرة أخرى.",
+      );
+    }
+
+    markLocalClosing(input.branchId, input.businessDate);
+
+    const offlineWarnings: string[] = [
+      "تم الحفظ محليًا (وضع عدم الاتصال). يُرجى إعادة الإرسال يدويًا عند توفّر الاتصال.",
+    ];
+    if (imagesStripped) {
+      offlineWarnings.push(
+        "لم يتم الاحتفاظ بالصور المرفقة على هذا الجهاز لضمان حفظ بيانات الإقفال. يُرجى إعادة رفع الصور عند توفّر الاتصال.",
+      );
+    }
+
+    return {
+      closing: {
+        ...baseClosing,
+        zReportImageUrl: imagesStripped
+          ? undefined
+          : input.zReportImageUrl,
+        paymentProofImageUrls: imagesStripped
+          ? undefined
+          : input.paymentProofImageUrls,
+      },
+      source: "local-queued",
+      warnings: offlineWarnings,
+    };
+  }
+
+  // Online path: upload images to the private bucket, then insert the row.
+  let uploadedZ: string | null = null;
+  const uploadedProofs: string[] = [];
+
+  if (input.zReportImageUrl) {
+    const r = await tryUploadImage(
+      input.zReportImageUrl,
+      `${input.branchId}/z-report`,
+      id,
+      "z_report",
+    );
+    uploadedZ = r.path;
+    if (r.warning) warnings.push(r.warning);
+  }
+
+  if (input.paymentProofImageUrls && input.paymentProofImageUrls.length > 0) {
+    for (const dataUrl of input.paymentProofImageUrls) {
+      const r = await tryUploadImage(
+        dataUrl,
+        `${input.branchId}/proofs`,
+        id,
+        "payment_proof",
+      );
+      if (r.path) {
+        uploadedProofs.push(r.path);
+      } else if (r.warning) {
+        if (!warnings.includes(r.warning)) warnings.push(r.warning);
+      }
+    }
+  }
+
+  const supabase = getSupabase();
+  const insertRow = {
+    id,
+    branch_id: input.branchId,
+    business_date: input.businessDate,
+    status: "pending",
+    reviewed_data: input.reviewedData,
+    manual_actual_cash: input.manualActualCash ?? null,
+    // M1: persist the storage object PATH, not a URL. The column name is
+    // historical (z_report_image_url); a follow-up migration may rename it.
+    z_report_image_url: uploadedZ,
+    payment_proof_image_urls:
+      uploadedProofs.length > 0 ? uploadedProofs : null,
+    ai_extracted_data: input.aiExtractedData ?? null,
+    ai_confidence: input.aiConfidence ?? null,
+    manually_modified_fields: input.manuallyModifiedFields ?? null,
+  };
+
+  const { error: insertError } = await supabase
+    .from("daily_closings")
+    .insert(insertRow);
+  if (insertError) {
+    // M3: an insert failure is NOT a silent queue. Throw the Arabic error
+    // so saveError shows and the cashier stays on step 2 to retry.
+    console.error(
+      "[closings] daily_closings insert failed",
+      insertError.message,
+    );
+    throw new Error(
+      "تعذّر حفظ الإقفال في الخادم. يُرجى المحاولة مرة أخرى.",
+    );
+  }
+
+  markLocalClosing(input.branchId, input.businessDate);
+
+  // Audit logs: ai_extracted (if AI populated data) then cashier_confirmed.
+  const logs: Array<{
+    closing_id: string;
+    actor_role: string;
+    action: string;
+  }> = [];
+  if (
+    input.aiExtractedData &&
+    Object.keys(input.aiExtractedData).length > 0
+  ) {
+    logs.push({
+      closing_id: id,
+      actor_role: "ai",
+      action: "ai_extracted",
+    });
+  }
+  logs.push({
+    closing_id: id,
+    actor_role: "cashier",
+    action: "cashier_confirmed",
+  });
+  // M4: supabase-js RESOLVES with { data, error } and does not reject,
+  // so inspect the returned error and surface a non-fatal warning.
+  const { error: auditError } = await supabase
+    .from("daily_closing_audit_logs")
+    .insert(logs);
+  if (auditError) {
+    console.error(
+      "[closings] audit log insert failed",
+      auditError.message,
+    );
+    warnings.push(
+      "تعذّر تسجيل سجل المراجعة — يتم متابعة الحفظ على أي حال.",
+    );
+  }
+
+  return {
+    closing: {
+      ...baseClosing,
+      zReportImageUrl: uploadedZ ?? undefined,
+      paymentProofImageUrls:
+        uploadedProofs.length > 0 ? uploadedProofs : undefined,
+    },
+    source: "supabase",
+    warnings,
+  };
+}
+===ENDFILE===
+===FILE: supabase/migrations/004_ai_extraction.sql===
+-- M3: AI extraction metadata for daily_closings
+-- Run once in Supabase Dashboard → SQL Editor → New query → Run
+-- Path: supabase/migrations/004_ai_extraction.sql
+--
+-- Adds columns to track AI-extracted financial fields, model confidence,
+-- and which fields the cashier modified after extraction. Idempotent.
+
+alter table public.daily_closings
+  add column if not exists ai_extracted_data jsonb;
+
+alter table public.daily_closings
+  add column if not exists ai_confidence jsonb;
+
+alter table public.daily_closings
+  add column if not exists manually_modified_fields text[];
+===ENDFILE===
+END_M3
