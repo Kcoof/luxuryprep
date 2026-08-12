@@ -1,0 +1,1380 @@
+===FILE: app/api/analyze-closing-image/route.ts===
+// M3: GLM vision OCR for Z-report images.
+// Server-only route — never bundle GLM secrets into the client.
+// Constitution rule: never reference NEXT_PUBLIC_ for GLM env vars.
+import { NextRequest, NextResponse } from "next/server";
+
+export const runtime = "nodejs";
+
+const MAX_BYTES = 10 * 1024 * 1024; // 10 MB decoded
+const UPSTREAM_TIMEOUT_MS = 60_000;
+
+const ALLOWED_FIELDS = [
+  "grossSales",
+  "netSales",
+  "cashSystem",
+  "spanSystem",
+  "deliveryAppsSystem",
+  "reversedTransactions",
+  "cashActualHanded",
+] as const;
+
+type ExtractableField = (typeof ALLOWED_FIELDS)[number];
+type ExtractedFields = Partial<Record<ExtractableField, number>>;
+
+interface AnalyzeResponse {
+  fields: ExtractedFields;
+  finishReason: string | null;
+  model: string;
+}
+
+function buildPrompt(): string {
+  return [
+    "You are an OCR assistant that extracts financial values from an Arabic Z-report (daily point-of-sale closing report) image.",
+    "Return ONLY raw JSON. Do not include prose, markdown, or code fences.",
+    "If a value is missing, illegible, or ambiguous, return null for that key.",
+    "Strip thousands separators (commas or spaces) and use a dot (.) as the decimal separator.",
+    "Do not invent values. Do not compute shortage/excess.",
+    "",
+    "Return exactly these keys (Arabic label in parentheses for guidance):",
+    '- "grossSales": إجمالي المبيعات',
+    '- "netSales": صافي المبيعات',
+    '- "cashSystem": النقدية حسب النظام',
+    '- "spanSystem": سبان',
+    '- "deliveryAppsSystem": تطبيقات التوصيل',
+    '- "reversedTransactions": حركات مرتجعة',
+    '- "cashActualHanded": النقدية المسلّمة فعليًا',
+    "",
+    'Example output: {"grossSales": 1234.56, "netSales": 1100.00, "cashSystem": 500.00, "spanSystem": 200.00, "deliveryAppsSystem": 150.00, "reversedTransactions": 25.00, "cashActualHanded": 498.00}',
+  ].join("\n");
+}
+
+function stripCodeFence(raw: string): string {
+  let s = raw.trim();
+  if (s.startsWith("```")) {
+    s = s.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
+  }
+  return s.trim();
+}
+
+function coerceFields(parsed: unknown): ExtractedFields {
+  const out: ExtractedFields = {};
+  if (!parsed || typeof parsed !== "object") return out;
+  const obj = parsed as Record<string, unknown>;
+  for (const key of ALLOWED_FIELDS) {
+    const v = obj[key];
+    if (v === null || v === undefined) continue;
+    const n = Number(v);
+    if (Number.isFinite(n)) out[key] = n;
+  }
+  return out;
+}
+
+function decodeBase64Length(base64: string): number {
+  try {
+    return Buffer.from(base64, "base64").byteLength;
+  } catch {
+    // Fallback: approximate length (4 chars -> 3 bytes, padded).
+    const padding = base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0;
+    return Math.floor((base64.length * 3) / 4) - padding;
+  }
+}
+
+export async function POST(req: NextRequest): Promise<Response> {
+  const apiKey = process.env.GLM_API_KEY;
+  const baseUrl = process.env.GLM_BASE_URL;
+  const visionModel = process.env.GLM_VISION_MODEL;
+
+  if (!apiKey || !baseUrl || !visionModel) {
+    return NextResponse.json(
+      { error: "خدمة تحليل الصور غير مُهيّأة. يُرجى التواصل مع الإدارة." },
+      { status: 503 },
+    );
+  }
+
+  let body: unknown;
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json(
+      { error: "صيغة الطلب غير صحيحة." },
+      { status: 400 },
+    );
+  }
+
+  const { imageBase64 } = (body ?? {}) as { imageBase64?: unknown };
+  if (typeof imageBase64 !== "string" || imageBase64.length === 0) {
+    return NextResponse.json(
+      { error: "لم يتم توفير صورة." },
+      { status: 400 },
+    );
+  }
+
+  let mime = "image/jpeg";
+  let dataUrl: string;
+  if (imageBase64.startsWith("data:")) {
+    const m = imageBase64.match(/^data:([^;]+);base64,/);
+    if (!m) {
+      return NextResponse.json(
+        { error: "صيغة الصورة غير صحيحة." },
+        { status: 400 },
+      );
+    }
+    mime = m[1];
+    dataUrl = imageBase64;
+  } else {
+    dataUrl = `data:${mime};base64,${imageBase64}`;
+  }
+
+  if (!mime.startsWith("image/")) {
+    return NextResponse.json(
+      { error: "الملف المُرفق ليس صورة مدعومة." },
+      { status: 415 },
+    );
+  }
+
+  const rawBase64 = dataUrl.split(",")[1] ?? "";
+  const byteLength = decodeBase64Length(rawBase64);
+  if (byteLength > MAX_BYTES) {
+    return NextResponse.json(
+      { error: "حجم الصورة كبير جدًا (الحد الأقصى ١٠ ميجابايت)." },
+      { status: 413 },
+    );
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
+
+  try {
+    const upstream = await fetch(`${baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: visionModel,
+        temperature: 0,
+        max_tokens: 2048,
+        thinking: { type: "disabled" },
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: buildPrompt() },
+              { type: "image_url", image_url: { url: dataUrl } },
+            ],
+          },
+        ],
+      }),
+      signal: controller.signal,
+    });
+
+    if (!upstream.ok) {
+      const text = await upstream.text().catch(() => "");
+      return NextResponse.json(
+        {
+          error: "تعذّر تحليل الصورة من مزوّد الخدمة.",
+          upstreamStatus: upstream.status,
+          upstreamPreview: text.slice(0, 300),
+        },
+        { status: 502 },
+      );
+    }
+
+    const data = (await upstream.json()) as {
+      choices?: Array<{
+        message?: { content?: string };
+        finish_reason?: string;
+      }>;
+    };
+
+    const choice = data.choices?.[0];
+    const content = choice?.message?.content ?? "";
+    const finishReason = choice?.finish_reason ?? null;
+
+    if (!content.trim()) {
+      return NextResponse.json(
+        {
+          error: "لم يتم استخراج أي بيانات من الصورة.",
+          finishReason,
+        },
+        { status: 502 },
+      );
+    }
+
+    const cleaned = stripCodeFence(content);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(cleaned);
+    } catch {
+      return NextResponse.json(
+        {
+          error: "تعذّر تفسير نتيجة التحليل.",
+          finishReason,
+          rawPreview: cleaned.slice(0, 300),
+        },
+        { status: 502 },
+      );
+    }
+
+    const fields = coerceFields(parsed);
+    const payload: AnalyzeResponse = { fields, finishReason, model: visionModel };
+    return NextResponse.json(payload);
+  } catch (err) {
+    if ((err as Error)?.name === "AbortError") {
+      return NextResponse.json(
+        { error: "انتهت مهلة تحليل الصورة. يُرجى المحاولة مرة أخرى." },
+        { status: 504 },
+      );
+    }
+    return NextResponse.json(
+      { error: "حدث خطأ غير متوقّع أثناء التحليل." },
+      { status: 500 },
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+}
+===ENDFILE===
+
+===FILE: app/cashier/page.tsx===
+"use client";
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import Link from "next/link";
+import {
+  ArrowRight,
+  Calculator,
+  Check,
+  Lock,
+  AlertCircle,
+  RotateCcw,
+  Sparkles,
+  Loader2,
+} from "lucide-react";
+import {
+  Branch,
+  FinancialFields,
+  EMPTY_FINANCIAL_FIELDS,
+  computeShortageOrExcess,
+} from "../types";
+import { loadBranches } from "../lib/branches";
+import {
+  checkDuplicateClosing,
+  saveClosing,
+  ClosingResult,
+} from "../lib/closings";
+
+type Step = 1 | 2 | 3;
+
+const BRANCH_SESSION_KEY = "cashier_selected_branch";
+
+interface SavedBranch {
+  id: string;
+  name: string;
+}
+
+const AI_EXTRACTABLE_FIELDS: (keyof FinancialFields)[] = [
+  "grossSales",
+  "netSales",
+  "cashSystem",
+  "cashActualHanded",
+  "spanSystem",
+  "deliveryAppsSystem",
+  "reversedTransactions",
+];
+
+type FieldBadge = "ai" | "manual" | null;
+
+export default function CashierPage() {
+  const [step, setStep] = useState<Step>(1);
+  const [branches, setBranches] = useState<Branch[]>([]);
+  const [branchesLoading, setBranchesLoading] = useState(true);
+  const [branchesError, setBranchesError] = useState<string | null>(null);
+  const [selectedBranch, setSelectedBranch] = useState<Branch | null>(null);
+  const [isBranchLocked, setIsBranchLocked] = useState(false);
+  const [businessDate, setBusinessDate] = useState(
+    new Date().toISOString().split("T")[0],
+  );
+  const [fields, setFields] = useState<FinancialFields>({
+    ...EMPTY_FINANCIAL_FIELDS,
+  });
+  const [manualActualCash, setManualActualCash] = useState("");
+  const [useManualCash, setUseManualCash] = useState(false);
+  const [zReportImage, setZReportImage] = useState<string | null>(null);
+  const [proofImages, setProofImages] = useState<string[]>([]);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [warnings, setWarnings] = useState<string[]>([]);
+  const [closingId, setClosingId] = useState<string | null>(null);
+  const [saveSource, setSaveSource] = useState<
+    ClosingResult["source"] | null
+  >(null);
+  const pendingBranchRestore = useRef<SavedBranch | null>(null);
+
+  // M3: AI extraction state
+  const [aiExtractedData, setAiExtractedData] = useState<
+    Partial<FinancialFields>
+  >({});
+  const [manuallyModifiedFields, setManuallyModifiedFields] = useState<
+    (keyof FinancialFields)[]
+  >([]);
+  const [aiAnalyzing, setAiAnalyzing] = useState(false);
+  const [aiError, setAiError] = useState<string | null>(null);
+  const [aiNotice, setAiNotice] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setBranchesLoading(true);
+    loadBranches()
+      .then((result) => {
+        if (!cancelled) {
+          setBranches(result);
+          setBranchesError(null);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setBranchesError("تعذّر تحميل قائمة الفروع");
+      })
+      .finally(() => {
+        if (!cancelled) setBranchesLoading(false);
+      });
+
+    // Restore previously selected branch from localStorage (Major #5)
+    try {
+      const saved =
+        typeof window !== "undefined"
+          ? window.localStorage.getItem(BRANCH_SESSION_KEY)
+          : null;
+      if (saved) {
+        pendingBranchRestore.current = JSON.parse(saved) as SavedBranch;
+      }
+    } catch {
+      // ignore parse errors
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Once branches are loaded, re-lock to the saved branch (if any).
+  useEffect(() => {
+    if (
+      branches.length > 0 &&
+      !selectedBranch &&
+      pendingBranchRestore.current
+    ) {
+      const match = branches.find(
+        (b) => b.id === pendingBranchRestore.current!.id,
+      );
+      if (match) {
+        setSelectedBranch(match);
+        setIsBranchLocked(true);
+      }
+      pendingBranchRestore.current = null;
+    }
+  }, [branches, selectedBranch]);
+
+  const effectiveActualCash =
+    useManualCash && manualActualCash !== ""
+      ? parseFloat(manualActualCash) || 0
+      : fields.cashActualHanded;
+
+  useEffect(() => {
+    setFields((prev) => ({
+      ...prev,
+      shortageOrExcess: computeShortageOrExcess(
+        effectiveActualCash,
+        prev.cashSystem,
+      ),
+    }));
+  }, [effectiveActualCash, fields.cashSystem]);
+
+  const handlePickBranch = (branch: Branch) => {
+    setSelectedBranch(branch);
+    setIsBranchLocked(true);
+    try {
+      window.localStorage.setItem(
+        BRANCH_SESSION_KEY,
+        JSON.stringify({
+          id: branch.id,
+          name: branch.name,
+        } satisfies SavedBranch),
+      );
+    } catch {
+      // ignore quota / privacy errors
+    }
+  };
+
+  const resetInputs = () => {
+    setFields({ ...EMPTY_FINANCIAL_FIELDS });
+    setManualActualCash("");
+    setUseManualCash(false);
+    setZReportImage(null);
+    setProofImages([]);
+    setSaveError(null);
+    setWarnings([]);
+    setClosingId(null);
+    setSaveSource(null);
+    setAiExtractedData({});
+    setManuallyModifiedFields([]);
+    setAiAnalyzing(false);
+    setAiError(null);
+    setAiNotice(null);
+  };
+
+  const handleConfirmBranchChange = () => {
+    if (window.confirm("تغيير الفرع؟ سيتم فقدان البيانات المدخلة.")) {
+      setSelectedBranch(null);
+      setIsBranchLocked(false);
+      setStep(1);
+      resetInputs();
+      try {
+        window.localStorage.removeItem(BRANCH_SESSION_KEY);
+      } catch {
+        // ignore
+      }
+    }
+  };
+
+  const handleStartNewClosing = () => {
+    setStep(1);
+    resetInputs();
+    // Keep the currently selected branch locked for convenience
+  };
+
+  const setField = (key: keyof FinancialFields, raw: string) => {
+    // M3: if AI extraction has populated data and the cashier edits a field,
+    // record it as manually modified.
+    if (
+      Object.keys(aiExtractedData).length > 0 &&
+      !manuallyModifiedFields.includes(key)
+    ) {
+      setManuallyModifiedFields((prev) => [...prev, key]);
+    }
+    if (raw === "") {
+      setFields((prev) => ({ ...prev, [key]: 0 }));
+      return;
+    }
+    const num = parseFloat(raw);
+    setFields((prev) => ({
+      ...prev,
+      [key]: Number.isFinite(num) ? num : prev[key],
+    }));
+  };
+
+  const displayValue = (v: number) => (v === 0 ? "" : String(v));
+
+  const onZReport = (file?: File) => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => setZReportImage(reader.result as string);
+    reader.readAsDataURL(file);
+  };
+
+  const onProofs = (files: FileList | null) => {
+    if (!files) return;
+    Array.from(files).forEach((file) => {
+      const reader = new FileReader();
+      reader.onload = () =>
+        setProofImages((prev) => [...prev, reader.result as string]);
+      reader.readAsDataURL(file);
+    });
+  };
+
+  const handleAnalyzeImage = useCallback(async () => {
+    if (!zReportImage) return;
+    setAiAnalyzing(true);
+    setAiError(null);
+    setAiNotice(null);
+    try {
+      const res = await fetch("/api/analyze-closing-image", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ imageBase64: zReportImage }),
+      });
+      const data = (await res.json().catch(() => null)) as {
+        error?: string;
+        fields?: Partial<FinancialFields>;
+        finishReason?: string | null;
+        model?: string;
+      } | null;
+
+      if (!res.ok || !data) {
+        const msg =
+          data?.error ?? "تعذّر تحليل الصورة. يُرجى إدخال البيانات يدويًا.";
+        setAiError(msg);
+        return;
+      }
+
+      const extracted: Partial<FinancialFields> = data.fields ?? {};
+      setAiExtractedData(extracted);
+      setManuallyModifiedFields([]);
+      setFields((prev) => {
+        const next: FinancialFields = { ...prev };
+        for (const key of AI_EXTRACTABLE_FIELDS) {
+          const v = extracted[key];
+          if (typeof v === "number" && Number.isFinite(v)) {
+            (next as Record<string, number>)[key as string] = v;
+          }
+        }
+        next.shortageOrExcess = computeShortageOrExcess(
+          next.cashActualHanded,
+          next.cashSystem,
+        );
+        return next;
+      });
+      const filled = AI_EXTRACTABLE_FIELDS.filter(
+        (k) => typeof extracted[k] === "number",
+      ).length;
+      setAiNotice(
+        filled > 0
+          ? `تمت تعبئة ${filled} حقل من تحليل الصورة. يمكنك مراجعتها وتعديلها.`
+          : "لم يستطع النموذج استخراج قيم واضحة. يُرجى الإدخال يدويًا.",
+      );
+    } catch (e) {
+      setAiError(
+        e instanceof Error
+          ? e.message
+          : "تعذّر تحليل الصورة. يُرجى إدخال البيانات يدويًا.",
+      );
+    } finally {
+      setAiAnalyzing(false);
+    }
+  }, [zReportImage]);
+
+  const badgeFor = (key: keyof FinancialFields): FieldBadge => {
+    if (manuallyModifiedFields.includes(key)) return "manual";
+    if (
+      Object.keys(aiExtractedData).length > 0 &&
+      typeof aiExtractedData[key] === "number"
+    ) {
+      return "ai";
+    }
+    return null;
+  };
+
+  const handleSave = useCallback(async () => {
+    if (!selectedBranch) return;
+    setSaving(true);
+    setSaveError(null);
+    setWarnings([]);
+    try {
+      const dup = await checkDuplicateClosing(
+        selectedBranch.id,
+        businessDate,
+      );
+      if (dup) {
+        const ok = window.confirm(
+          "يوجد إقفال لهذا الفرع في هذا التاريخ. هل تريد المتابعة؟",
+        );
+        if (!ok) {
+          setSaving(false);
+          return;
+        }
+      }
+      const result = await saveClosing({
+        branchId: selectedBranch.id,
+        businessDate,
+        reviewedData: { ...fields },
+        manualActualCash:
+          useManualCash && manualActualCash !== ""
+            ? parseFloat(manualActualCash)
+            : undefined,
+        zReportImageUrl: zReportImage ?? undefined,
+        paymentProofImageUrls:
+          proofImages.length > 0 ? proofImages : undefined,
+        aiExtractedData:
+          Object.keys(aiExtractedData).length > 0 ? aiExtractedData : undefined,
+        manuallyModifiedFields:
+          manuallyModifiedFields.length > 0
+            ? manuallyModifiedFields
+            : undefined,
+      });
+      setClosingId(result.closing.id);
+      setSaveSource(result.source);
+      setWarnings(result.warnings);
+      setStep(3);
+    } catch (e) {
+      setSaveError(
+        e instanceof Error ? e.message : "حدث خطأ أثناء الحفظ",
+      );
+    } finally {
+      setSaving(false);
+    }
+  }, [
+    selectedBranch,
+    businessDate,
+    fields,
+    useManualCash,
+    manualActualCash,
+    zReportImage,
+    proofImages,
+    aiExtractedData,
+    manuallyModifiedFields,
+  ]);
+
+  return (
+    <main className="mx-auto max-w-3xl px-4 py-10" dir="rtl">
+      <Link
+        href="/"
+        className="mb-6 inline-flex items-center gap-1 text-sm text-slate-600 hover:text-slate-900"
+      >
+        <ArrowRight className="h-4 w-4" />
+        العودة للرئيسية
+      </Link>
+      <div className="card-frame p-6">
+        <div className="mb-6 flex items-center gap-3">
+          <Calculator className="h-8 w-8 text-emerald-600" />
+          <h1 className="text-2xl font-bold">شاشة الكاشير</h1>
+        </div>
+        <div className="mb-6 flex items-center justify-center gap-2">
+          {([1, 2, 3] as const).map((s) => (
+            <div
+              key={s}
+              className={`flex h-8 w-8 items-center justify-center rounded-full text-sm font-bold ${
+                step >= s
+                  ? "bg-emerald-600 text-white"
+                  : "bg-slate-200 text-slate-500"
+              }`}
+            >
+              {s}
+            </div>
+          ))}
+        </div>
+
+        {/* Step 1 */}
+        {step === 1 && (
+          <div className="space-y-5">
+            <h2 className="text-lg font-semibold">
+              الخطوة ١: اختيار الفرع والتاريخ
+            </h2>
+            {/* Branch */}
+            <div>
+              <label className="mb-1 block text-sm font-medium text-slate-700">
+                الفرع
+              </label>
+              {branchesLoading ? (
+                <p className="text-sm text-slate-500">جارٍ تحميل الفروع…</p>
+              ) : branchesError ? (
+                <p className="text-sm text-red-600">{branchesError}</p>
+              ) : !isBranchLocked ? (
+                <select
+                  className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
+                  value={selectedBranch?.id ?? ""}
+                  onChange={(e) => {
+                    const b = branches.find(
+                      (x) => x.id === e.target.value,
+                    );
+                    if (b) handlePickBranch(b);
+                  }}
+                >
+                  <option value="">— اختر الفرع —</option>
+                  {branches.map((b) => (
+                    <option key={b.id} value={b.id}>
+                      {b.id} — {b.name}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <div className="flex items-center gap-2 rounded-md bg-slate-100 px-3 py-2">
+                  <Lock className="h-4 w-4 text-slate-500" />
+                  <span className="text-sm font-medium">
+                    {selectedBranch?.id} — {selectedBranch?.name}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={handleConfirmBranchChange}
+                    className="mr-auto text-xs text-emerald-600 hover:underline"
+                  >
+                    تغيير الفرع
+                  </button>
+                </div>
+              )}
+            </div>
+            {/* Date */}
+            <div>
+              <label className="mb-1 block text-sm font-medium text-slate-700">
+                تاريخ العمل
+              </label>
+              <input
+                type="date"
+                className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
+                value={businessDate}
+                onChange={(e) => setBusinessDate(e.target.value)}
+              />
+            </div>
+            {/* Z-Report image */}
+            <div>
+              <label className="mb-1 block text-sm font-medium text-slate-700">
+                صورة تقرير Z (اختياري)
+              </label>
+              <input
+                type="file"
+                accept="image/*"
+                onChange={(e) => onZReport(e.target.files?.[0])}
+                className="block w-full text-sm"
+              />
+              {zReportImage && (
+                /* eslint-disable-next-line @next/next/no-img-element */
+                <img
+                  src={zReportImage}
+                  alt="Z-Report"
+                  className="mt-2 max-h-48 rounded border"
+                />
+              )}
+            </div>
+            {/* Payment proofs */}
+            <div>
+              <label className="mb-1 block text-sm font-medium text-slate-700">
+                صور إثبات الدفع (اختياري)
+              </label>
+              <input
+                type="file"
+                accept="image/*"
+                multiple
+                onChange={(e) => onProofs(e.target.files)}
+                className="block w-full text-sm"
+              />
+              {proofImages.length > 0 && (
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {proofImages.map((img, i) => (
+                    /* eslint-disable-next-line @next/next/no-img-element */
+                    <img
+                      key={i}
+                      src={img}
+                      alt={`Proof ${i + 1}`}
+                      className="h-24 rounded border"
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+            <button
+              type="button"
+              className="w-full rounded-md bg-emerald-600 px-4 py-2 font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+              disabled={!selectedBranch || !businessDate}
+              onClick={() => setStep(2)}
+            >
+              التالي
+            </button>
+          </div>
+        )}
+
+        {/* Step 2 */}
+        {step === 2 && (
+          <div className="space-y-4">
+            <h2 className="text-lg font-semibold">
+              الخطوة ٢: البيانات المالية
+            </h2>
+
+            {/* M3: AI analysis button */}
+            <div className="rounded-md border border-violet-200 bg-violet-50 p-3">
+              <div className="flex items-center gap-2">
+                <Sparkles className="h-4 w-4 text-violet-600" />
+                <span className="text-sm font-medium text-violet-900">
+                  تحليل بالذكاء الاصطناعي
+                </span>
+              </div>
+              <p className="mt-1 text-xs text-violet-800">
+                يستخرج القيم من صورة تقرير Z تلقائيًا. يمكنك دائمًا تعديل أي قيمة بعد الاستخراج.
+              </p>
+              <button
+                type="button"
+                onClick={handleAnalyzeImage}
+                disabled={!zReportImage || aiAnalyzing}
+                className="mt-2 inline-flex w-full items-center justify-center gap-2 rounded-md bg-violet-600 px-4 py-2 text-sm font-medium text-white hover:bg-violet-700 disabled:opacity-50"
+              >
+                {aiAnalyzing ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    جارٍ التحليل…
+                  </>
+                ) : (
+                  <>
+                    <Sparkles className="h-4 w-4" />
+                    تحليل صورة تقرير Z
+                  </>
+                )}
+              </button>
+              {!zReportImage && (
+                <p className="mt-1 text-xs text-violet-700">
+                  عُد للخطوة السابقة لرفع صورة تقرير Z أولًا.
+                </p>
+              )}
+              {aiNotice && (
+                <p className="mt-2 text-xs font-medium text-violet-900">
+                  {aiNotice}
+                </p>
+              )}
+              {aiError && (
+                <div className="mt-2 flex items-start gap-2 rounded bg-red-50 p-2 text-xs text-red-700">
+                  <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                  <span>{aiError}</span>
+                </div>
+              )}
+            </div>
+
+            <NumberInput
+              label="إجمالي المبيعات"
+              value={displayValue(fields.grossSales)}
+              onChange={(v) => setField("grossSales", v)}
+              badge={badgeFor("grossSales")}
+            />
+            <NumberInput
+              label="صافي المبيعات"
+              value={displayValue(fields.netSales)}
+              onChange={(v) => setField("netSales", v)}
+              badge={badgeFor("netSales")}
+            />
+            <NumberInput
+              label="النقدية حسب النظام"
+              value={displayValue(fields.cashSystem)}
+              onChange={(v) => setField("cashSystem", v)}
+              badge={badgeFor("cashSystem")}
+            />
+            {/* Manual actual cash */}
+            <div className="rounded-md border border-slate-200 p-3">
+              <label className="flex items-center gap-2 text-sm font-medium">
+                <input
+                  type="checkbox"
+                  checked={useManualCash}
+                  onChange={(e) => setUseManualCash(e.target.checked)}
+                />
+                إدخال النقدية الفعلية يدويًا
+              </label>
+              {useManualCash ? (
+                <input
+                  type="number"
+                  className="mt-2 w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
+                  placeholder="النقدية الفعلية"
+                  value={manualActualCash}
+                  onChange={(e) => setManualActualCash(e.target.value)}
+                />
+              ) : (
+                <div className="mt-2">
+                  <NumberInput
+                    label="النقدية المسلّمة"
+                    value={displayValue(fields.cashActualHanded)}
+                    onChange={(v) => setField("cashActualHanded", v)}
+                    badge={badgeFor("cashActualHanded")}
+                  />
+                </div>
+              )}
+            </div>
+            <NumberInput
+              label="سبان"
+              value={displayValue(fields.spanSystem)}
+              onChange={(v) => setField("spanSystem", v)}
+              badge={badgeFor("spanSystem")}
+            />
+            <NumberInput
+              label="تطبيقات التوصيل"
+              value={displayValue(fields.deliveryAppsSystem)}
+              onChange={(v) => setField("deliveryAppsSystem", v)}
+              badge={badgeFor("deliveryAppsSystem")}
+            />
+            <NumberInput
+              label="حركات مرتجعة"
+              value={displayValue(fields.reversedTransactions)}
+              onChange={(v) => setField("reversedTransactions", v)}
+              badge={badgeFor("reversedTransactions")}
+            />
+            {/* Shortage/excess display */}
+            <div className="rounded-md bg-slate-50 p-3">
+              <div className="flex items-center justify-between">
+                <span className="text-sm font-medium">
+                  العجز / الزيادة
+                </span>
+                <span
+                  className={`text-lg font-bold ${
+                    fields.shortageOrExcess < 0
+                      ? "text-red-600"
+                      : fields.shortageOrExcess > 0
+                        ? "text-emerald-600"
+                        : "text-slate-500"
+                  }`}
+                >
+                  {fields.shortageOrExcess.toFixed(2)} ر.س
+                </span>
+              </div>
+            </div>
+            {saveError && (
+              <div className="flex items-center gap-2 rounded-md bg-red-50 p-3 text-sm text-red-700">
+                <AlertCircle className="h-4 w-4 shrink-0" />
+                {saveError}
+              </div>
+            )}
+            <div className="flex gap-2">
+              <button
+                type="button"
+                className="flex-1 rounded-md border border-slate-300 px-4 py-2 font-medium text-slate-700 hover:bg-slate-50"
+                onClick={() => setStep(1)}
+              >
+                السابق
+              </button>
+              <button
+                type="button"
+                className="flex-1 rounded-md bg-emerald-600 px-4 py-2 font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+                disabled={saving}
+                onClick={handleSave}
+              >
+                {saving ? "جارٍ الحفظ…" : "حفظ الإقفال"}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Step 3 */}
+        {step === 3 && closingId && (
+          <div className="space-y-5 text-center">
+            <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-emerald-100">
+              <Check className="h-8 w-8 text-emerald-600" />
+            </div>
+            <h2 className="text-xl font-bold">تم إنشاء الإقفال</h2>
+            <p className="text-sm text-slate-600">
+              رقم الإقفال:{" "}
+              <span className="font-mono font-bold">{closingId}</span>
+            </p>
+            {saveSource === "local-queued" && (
+              <div className="rounded-md bg-amber-50 p-3">
+                <p className="text-sm font-medium text-amber-800">
+                  تم الحفظ محليًا (وضع عدم الاتصال) — سيُرفع لاحقًا عند توفّر الاتصال.
+                </p>
+              </div>
+            )}
+            {warnings.length > 0 && (
+              <div className="rounded-md bg-amber-50 p-3 text-right">
+                <p className="mb-1 text-xs font-semibold text-amber-900">
+                  تنبيهات:
+                </p>
+                <ul className="space-y-1 text-sm text-amber-800">
+                  {warnings.map((w, i) => (
+                    <li key={i}>• {w}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {saveSource !== "local-queued" && warnings.length === 0 && (
+              <div className="rounded-md bg-amber-50 p-3">
+                <p className="text-sm font-medium text-amber-800">
+                  بانتظار اعتماد الإدارة المالية
+                </p>
+              </div>
+            )}
+            <div className="flex flex-wrap justify-center gap-2">
+              <button
+                type="button"
+                onClick={handleStartNewClosing}
+                className="inline-flex items-center gap-2 rounded-md border border-slate-300 px-4 py-2 font-medium text-slate-700 hover:bg-slate-50"
+              >
+                <RotateCcw className="h-4 w-4" />
+                بدء إقفال جديد
+              </button>
+              <Link
+                href="/"
+                className="inline-block rounded-md bg-emerald-600 px-4 py-2 font-medium text-white hover:bg-emerald-700"
+              >
+                العودة للرئيسية
+              </Link>
+            </div>
+          </div>
+        )}
+      </div>
+    </main>
+  );
+}
+
+function FieldBadgePill({ kind }: { kind: "ai" | "manual" }) {
+  if (kind === "ai") {
+    return (
+      <span className="rounded bg-violet-100 px-1.5 py-0.5 text-[10px] font-semibold text-violet-700">
+        ذكاء اصطناعي
+      </span>
+    );
+  }
+  return (
+    <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold text-amber-700">
+      معدّل يدويًا
+    </span>
+  );
+}
+
+function NumberInput({
+  label,
+  value,
+  onChange,
+  badge,
+}: {
+  label: string;
+  value: string;
+  onChange: (val: string) => void;
+  badge?: FieldBadge;
+}) {
+  return (
+    <div>
+      <label className="mb-1 flex items-center gap-2 text-sm font-medium text-slate-700">
+        <span>{label}</span>
+        {badge && <FieldBadgePill kind={badge} />}
+      </label>
+      <input
+        type="number"
+        className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+      />
+    </div>
+  );
+}
+===ENDFILE===
+
+===FILE: app/lib/closings.ts===
+import { getSupabase, isSupabaseConfigured } from "./supabase";
+import {
+  DailyClosing,
+  FieldConfidence,
+  FinancialFields,
+} from "../types";
+
+const QUEUE_KEY = "cashier_offline_closings_queue";
+const PENDING_UPLOADS_KEY = "cashier_pending_uploads";
+const Z_REPORT_BUCKET = "z-reports";
+const PROOF_BUCKET = "payment-proofs";
+
+export interface SaveClosingInput {
+  branchId: string;
+  businessDate: string;
+  reviewedData: FinancialFields;
+  manualActualCash?: number;
+  zReportImageUrl?: string;
+  paymentProofImageUrls?: string[];
+  aiExtractedData?: Partial<FinancialFields>;
+  aiConfidence?: FieldConfidence;
+  manuallyModifiedFields?: (keyof FinancialFields)[];
+}
+
+export interface ClosingResult {
+  closing: DailyClosing;
+  source: "supabase" | "local-queued";
+  warnings: string[];
+}
+
+interface PendingUpload {
+  closingId: string;
+  type: "z_report" | "payment_proof";
+  dataUrl: string;
+  createdAt: string;
+}
+
+function dataUrlToBytes(
+  dataUrl: string,
+): { bytes: Uint8Array; mime: string; ext: string } | null {
+  const m = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
+  if (!m) return null;
+  const mime = m[1];
+  const base64 = m[2];
+  let ext = "jpg";
+  if (mime === "image/png") ext = "png";
+  else if (mime === "image/webp") ext = "webp";
+  else if (mime === "image/gif") ext = "gif";
+  try {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return { bytes, mime, ext };
+  } catch {
+    return null;
+  }
+}
+
+function genId(): string {
+  return `close-${Date.now()}`;
+}
+
+function readQueue(): SaveClosingInput[] {
+  try {
+    const raw = localStorage.getItem(QUEUE_KEY);
+    return raw ? (JSON.parse(raw) as SaveClosingInput[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeQueue(items: SaveClosingInput[]): void {
+  try {
+    localStorage.setItem(QUEUE_KEY, JSON.stringify(items));
+  } catch {
+    // ignore quota / privacy errors
+  }
+}
+
+function readPendingUploads(): PendingUpload[] {
+  try {
+    const raw = localStorage.getItem(PENDING_UPLOADS_KEY);
+    return raw ? (JSON.parse(raw) as PendingUpload[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function writePendingUploads(items: PendingUpload[]): void {
+  try {
+    localStorage.setItem(PENDING_UPLOADS_KEY, JSON.stringify(items));
+  } catch {
+    // ignore
+  }
+}
+
+function pushPendingUpload(entry: PendingUpload): void {
+  const items = readPendingUploads();
+  items.push(entry);
+  writePendingUploads(items);
+}
+
+export async function checkDuplicateClosing(
+  branchId: string,
+  businessDate: string,
+): Promise<boolean> {
+  if (!isSupabaseConfigured) return false;
+  try {
+    const supabase = getSupabase();
+    const { data } = await supabase
+      .from("daily_closings")
+      .select("id")
+      .eq("branch_id", branchId)
+      .eq("business_date", businessDate)
+      .maybeSingle();
+    return Boolean(data);
+  } catch {
+    return false;
+  }
+}
+
+async function tryUploadImage(
+  dataUrl: string,
+  bucket: string,
+  pathPrefix: string,
+): Promise<{ url: string | null; warning: string | null }> {
+  if (!isSupabaseConfigured) {
+    return { url: null, warning: null };
+  }
+  const parsed = dataUrlToBytes(dataUrl);
+  if (!parsed) {
+    return { url: null, warning: null };
+  }
+  try {
+    const fileName = `${pathPrefix}/${Date.now()}-${Math.random()
+      .toString(36)
+      .slice(2)}.${parsed.ext}`;
+    const supabase = getSupabase();
+    const { data, error } = await supabase.storage
+      .from(bucket)
+      .upload(fileName, parsed.bytes, {
+        contentType: parsed.mime,
+        upsert: false,
+      });
+    if (error || !data) {
+      return {
+        url: null,
+        warning: "تعذّر رفع إحدى الصور إلى التخزين — سيُعاد المحاولة لاحقًا.",
+      };
+    }
+    const { data: pub } = supabase.storage
+      .from(bucket)
+      .getPublicUrl(data.path);
+    return { url: pub.publicUrl, warning: null };
+  } catch {
+    return {
+      url: null,
+      warning: "تعذّر رفع إحدى الصور إلى التخزين — سيُعاد المحاولة لاحقًا.",
+    };
+  }
+}
+
+function isOnline(): boolean {
+  if (typeof navigator === "undefined") return true;
+  return navigator.onLine !== false;
+}
+
+export async function saveClosing(
+  input: SaveClosingInput,
+): Promise<ClosingResult> {
+  const id = genId();
+  const warnings: string[] = [];
+  const now = new Date().toISOString();
+
+  const baseClosing: DailyClosing = {
+    id,
+    branchId: input.branchId,
+    businessDate: input.businessDate,
+    status: "pending",
+    reviewedData: { ...input.reviewedData },
+    manualActualCash: input.manualActualCash,
+    aiExtractedData: input.aiExtractedData,
+    aiConfidence: input.aiConfidence,
+    manuallyModifiedFields: input.manuallyModifiedFields,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  // Offline path: keep full input (including data URLs) in the local queue.
+  if (!isSupabaseConfigured || !isOnline()) {
+    const queue = readQueue();
+    queue.push({ ...input });
+    writeQueue(queue);
+    return {
+      closing: {
+        ...baseClosing,
+        zReportImageUrl: input.zReportImageUrl,
+        paymentProofImageUrls: input.paymentProofImageUrls,
+      },
+      source: "local-queued",
+      warnings: ["تم الحفظ محليًا وسيُرفع لاحقًا عند توفّر الاتصال."],
+    };
+  }
+
+  // Online path: attempt Storage uploads. On failure, retain the data URL
+  // in a pending uploads queue (M3 fix for M2 waived defect — never persist
+  // a data: URL into the URL column, but never drop the image silently).
+  let uploadedZ: string | null = null;
+  const uploadedProofs: string[] = [];
+
+  if (input.zReportImageUrl) {
+    const r = await tryUploadImage(
+      input.zReportImageUrl,
+      Z_REPORT_BUCKET,
+      input.branchId,
+    );
+    uploadedZ = r.url;
+    if (!r.url && r.warning) {
+      warnings.push(r.warning);
+      pushPendingUpload({
+        closingId: id,
+        type: "z_report",
+        dataUrl: input.zReportImageUrl,
+        createdAt: now,
+      });
+    }
+  }
+
+  if (input.paymentProofImageUrls && input.paymentProofImageUrls.length > 0) {
+    for (const dataUrl of input.paymentProofImageUrls) {
+      const r = await tryUploadImage(
+        dataUrl,
+        PROOF_BUCKET,
+        input.branchId,
+      );
+      if (r.url) {
+        uploadedProofs.push(r.url);
+      } else if (r.warning) {
+        // Only push the warning once per batch to avoid spam.
+        if (!warnings.includes(r.warning)) warnings.push(r.warning);
+        pushPendingUpload({
+          closingId: id,
+          type: "payment_proof",
+          dataUrl,
+          createdAt: now,
+        });
+      }
+    }
+  }
+
+  const supabase = getSupabase();
+  const insertRow = {
+    id,
+    branch_id: input.branchId,
+    business_date: input.businessDate,
+    status: "pending",
+    reviewed_data: input.reviewedData,
+    manual_actual_cash: input.manualActualCash ?? null,
+    z_report_image_url: uploadedZ,
+    payment_proof_image_urls:
+      uploadedProofs.length > 0 ? uploadedProofs : null,
+    ai_extracted_data: input.aiExtractedData ?? null,
+    ai_confidence: input.aiConfidence ?? null,
+    manually_modified_fields: input.manuallyModifiedFields ?? null,
+  };
+
+  const { error } = await supabase.from("daily_closings").insert(insertRow);
+  if (error) {
+    // Row insert failed: fall back to offline queue so nothing is lost.
+    const queue = readQueue();
+    queue.push({ ...input });
+    writeQueue(queue);
+    return {
+      closing: {
+        ...baseClosing,
+        zReportImageUrl: input.zReportImageUrl,
+        paymentProofImageUrls: input.paymentProofImageUrls,
+      },
+      source: "local-queued",
+      warnings: [
+        ...warnings,
+        "تعذّر الحفظ في الخادم — تم الحفظ محليًا وسيُعاد الرفع لاحقًا.",
+      ],
+    };
+  }
+
+  // Audit logs: ai_extracted (if AI populated data) then cashier_confirmed.
+  const logs: Array<{
+    closing_id: string;
+    actor_role: string;
+    action: string;
+  }> = [];
+  if (
+    input.aiExtractedData &&
+    Object.keys(input.aiExtractedData).length > 0
+  ) {
+    logs.push({
+      closing_id: id,
+      actor_role: "ai",
+      action: "ai_extracted",
+    });
+  }
+  logs.push({
+    closing_id: id,
+    actor_role: "cashier",
+    action: "cashier_confirmed",
+  });
+  try {
+    await supabase.from("daily_closing_audit_logs").insert(logs);
+  } catch {
+    // Non-fatal: audit failures should not block the closing flow.
+    warnings.push("تعذّر تسجيل سجل المراجعة — يتم متابعة الحفظ على أي حال.");
+  }
+
+  return {
+    closing: {
+      ...baseClosing,
+      zReportImageUrl: uploadedZ ?? undefined,
+      paymentProofImageUrls:
+        uploadedProofs.length > 0 ? uploadedProofs : undefined,
+    },
+    source: "supabase",
+    warnings,
+  };
+}
+===ENDFILE===
+
+===FILE: supabase/migrations/004_ai_extraction.sql===
+-- M3: AI extraction metadata for daily_closings
+-- Run once in Supabase Dashboard → SQL Editor → New query → Run
+-- Path: supabase/migrations/004_ai_extraction.sql
+--
+-- Adds columns to track AI-extracted financial fields, model confidence,
+-- and which fields the cashier modified after extraction. Idempotent.
+
+alter table public.daily_closings
+  add column if not exists ai_extracted_data jsonb;
+
+alter table public.daily_closings
+  add column if not exists ai_confidence jsonb;
+
+alter table public.daily_closings
+  add column if not exists manually_modified_fields text[];
+
+===ENDFILE===
+END_M3
