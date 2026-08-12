@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+  <head>
+    <meta charset="utf-8" />
+    <title>Z-Report probe fixture</title>
+    <style>
+      body { margin: 0; background: #fff; font-family: "Segoe UI", Tahoma, sans-serif; }
+      .receipt { width: 380px; padding: 18px 22px; color: #000; }
+      h1 { font-size: 18px; text-align: center; margin: 0 0 2px; }
+      .sub { text-align: center; font-size: 12px; color: #333; margin-bottom: 10px; }
+      hr { border: 0; border-top: 1px dashed #000; margin: 8px 0; }
+      .row { display: flex; justify-content: space-between; font-size: 14px; padding: 3px 0; }
+      .row .v { font-variant-numeric: tabular-nums; font-weight: 600; }
+      .total { font-size: 16px; font-weight: 700; }
+    </style>
+  </head>
+  <body>
+    <div class="receipt">
+      <h1>تقرير الإغلاق اليومي</h1>
+      <div class="sub">فرع الطايف (وج) — B02<br />التاريخ: 2026-08-12</div>
+      <hr />
+      <div class="row"><span>إجمالي المبيعات</span><span class="v">12,450.75</span></div>
+      <div class="row"><span>صافي المبيعات</span><span class="v">10,826.74</span></div>
+      <div class="row"><span>ضريبة القيمة المضافة</span><span class="v">1,624.01</span></div>
+      <hr />
+      <div class="row"><span>النقدية حسب النظام</span><span class="v">4,300.00</span></div>
+      <div class="row"><span>شبكة (مدى)</span><span class="v">5,126.74</span></div>
+      <div class="row"><span>تطبيقات التوصيل</span><span class="v">1,400.00</span></div>
+      <hr />
+      <div class="row"><span>حركات مرتجعة</span><span class="v">85.50</span></div>
+      <div class="row"><span>عدد الفواتير</span><span class="v">214</span></div>
+      <hr />
+      <div class="row total"><span>النقدية المسلّمة</span><span class="v">4,275.00</span></div>
+    </div>
+  </body>
+</html>

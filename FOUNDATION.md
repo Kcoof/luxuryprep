@@ -105,8 +105,19 @@ Core TypeScript contracts (implementation may use snake_case columns):
 - **No Gemini.** Image analysis uses **GLM** via Z.ai Coding Plan API.
 - Server endpoint: `POST /api/analyze-closing-image` (Next.js route).
 - Body: `{ imageBase64 }` (limit ~10mb).
-- Credentials: `GLM_API_KEY`, `GLM_BASE_URL=https://api.z.ai/api/coding/paas/v4`, `GLM_MODEL=GLM-5.2` (from `.sec` locally; mirror as server env on Vercel — never `NEXT_PUBLIC_`).
+- Credentials: `GLM_API_KEY`, `GLM_BASE_URL=https://api.z.ai/api/coding/paas/v4`, `GLM_MODEL=GLM-5.2`, **`GLM_VISION_MODEL=glm-4.6v`** (from `.sec` locally; mirror as server env on Vercel — never `NEXT_PUBLIC_`).
 - Prompt task: expert POS Z-report reader; respond **ONLY** with raw JSON: `grossSales`, `netSales`, `cashSystem`, `spanSystem`, `deliveryAppsSystem`, `reversedTransactions`.
+
+### Vision probe results (2026-08-12) — open point 1 resolved
+
+Verified against the live endpoint (`briefs/probe_glm_vision.js`, `briefs/probe_glm_ocr.js`):
+
+- **`GLM-5.2` cannot accept images.** Returns `400 code 1210 — messages.content.type is invalid, allowed values: ['text']`. It stays the *authoring* model only.
+- **`glm-4.6v` works** (`glm-4.5v` also works). Extraction must use a separate `GLM_VISION_MODEL`; do not reuse `GLM_MODEL`.
+- The endpoint's `/models` list omits `glm-4.6v` despite it working — **the list is not authoritative**, do not feature-detect from it.
+- **`thinking: { type: "disabled" }` is mandatory.** With thinking on, the model spends the whole `max_tokens` budget reasoning and returns empty content with `finish_reason: length`. Disabled: `finish=stop`, 111 completion tokens, ~6s. Enabled: empty, ~31s.
+- Accuracy on an Arabic RTL Z-report fixture (`briefs/fixtures/zreport-probe.html`): **10/11 fields exact**, including every monetary value and thousands-separator handling. Only `branchCode` came back `null`, which is harmless — branch is fixed by the cashier's locked session, not read from the image.
+- Budget note: ~4.2k prompt tokens per image, so the route needs a per-image cost/size guard.
 - Client computes/displays `cashActualHanded` (manual or from proof flow) and `shortageOrExcess`.
 - Confidence scores: include when GLM returns them; otherwise mark fields unscoped / default handling in UI.
 
@@ -116,7 +127,7 @@ Core TypeScript contracts (implementation may use snake_case columns):
 |--------|---------|
 | Product / KSA retail finance | Pass — clear cashier + auditor workflows |
 | Supabase + Vercel | Pass — already connected (`uujujcudeucabykfztic`, GitHub `luxuryprep`) |
-| GLM Vision/extract (Z.ai) | Pass if `GLM_API_KEY` available server-side; verify multimodal image support for receipt OCR in M3 |
+| GLM Vision/extract (Z.ai) | **Pass — verified 2026-08-12.** `glm-4.6v` extracted 10/11 fields from an Arabic Z-report in ~6s. Requires `thinking: disabled`; `GLM-5.2` is text-only |
 | Arabic RTL / Windows | Risk — UTF-8 discipline |
 | Brief’s Vite+Express | **Adapted** — not used as-is; Next API routes instead |
 | Gemini | **Out** — replaced by GLM per user |
@@ -158,8 +169,9 @@ Core TypeScript contracts (implementation may use snake_case columns):
 
 ## Open points escalated to user
 
-1. Confirm GLM multimodal/image path works for Foodics receipts during M3 (fallback: manual entry if vision unavailable).
+1. ~~Confirm GLM multimodal/image path works for Foodics receipts during M3.~~ **Resolved 2026-08-12** — `glm-4.6v` verified; no manual-entry fallback needed. See “Vision probe results”.
 2. Seed branch list + auditor/cashier users when ready.
+3. Validate extraction against a **real** Foodics Z-report photo (the probe used a clean synthetic render; camera glare, skew and crumpled paper are untested).
 
 ---
 
