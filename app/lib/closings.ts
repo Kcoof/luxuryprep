@@ -1,8 +1,12 @@
 import { getSupabase, isSupabaseConfigured } from "./supabase";
 import {
+  AuditAction,
+  ClosingStatus,
   DailyClosing,
+  DailyClosingAuditLog,
   FieldConfidence,
   FinancialFields,
+  UserRole,
 } from "../types";
 
 const QUEUE_KEY = "cashier_offline_closings_queue";
@@ -544,4 +548,246 @@ export async function saveClosing(
     source: "supabase",
     warnings,
   };
+}
+
+// ============================================================================
+// M4: Auditor portal helpers — list / fetch / approve / reject / audit logs.
+// All use lazy getSupabase(). No module-scope client.
+// ============================================================================
+
+interface ClosingRow {
+  id: string;
+  branch_id: string;
+  business_date: string;
+  status: string;
+  z_report_image_url: string | null;
+  payment_proof_image_urls: string[] | null;
+  reviewed_data: Partial<FinancialFields> | null;
+  manual_actual_cash: number | null;
+  ai_extracted_data: Partial<FinancialFields> | null;
+  ai_confidence: FieldConfidence | null;
+  manually_modified_fields: (keyof FinancialFields)[] | null;
+  auditor_id: string | null;
+  auditor_comment: string | null;
+  auditor_reviewed_at: string | null;
+  created_at: string;
+  updated_at: string;
+  branches?: { name: string; city: string } | null;
+}
+
+interface AuditLogRow {
+  id: string;
+  closing_id: string;
+  actor_role: string;
+  actor_id: string | null;
+  action: string;
+  comment: string | null;
+  timestamp: string;
+}
+
+export interface ClosingWithBranch extends DailyClosing {
+  branchName: string;
+  branchCity: string;
+}
+
+function mapRow(row: ClosingRow): ClosingWithBranch {
+  return {
+    id: row.id,
+    branchId: row.branch_id,
+    businessDate: row.business_date,
+    status: row.status as ClosingStatus,
+    zReportImageUrl: row.z_report_image_url ?? undefined,
+    paymentProofImageUrls: row.payment_proof_image_urls ?? undefined,
+    reviewedData: row.reviewed_data ?? undefined,
+    manualActualCash: row.manual_actual_cash ?? undefined,
+    aiExtractedData: row.ai_extracted_data ?? undefined,
+    aiConfidence: row.ai_confidence ?? undefined,
+    manuallyModifiedFields: row.manually_modified_fields ?? undefined,
+    auditorId: row.auditor_id ?? undefined,
+    auditorComment: row.auditor_comment ?? undefined,
+    auditorReviewedAt: row.auditor_reviewed_at ?? undefined,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    branchName: row.branches?.name ?? "—",
+    branchCity: row.branches?.city ?? "",
+  };
+}
+
+export async function listClosings(
+  statusFilter: "all" | ClosingStatus = "all",
+): Promise<ClosingWithBranch[]> {
+  if (!isSupabaseConfigured) return [];
+  const supabase = getSupabase();
+  let query = supabase
+    .from("daily_closings")
+    .select("*, branches(name, city)")
+    .order("business_date", { ascending: false })
+    .order("created_at", { ascending: false });
+  if (statusFilter !== "all") {
+    query = query.eq("status", statusFilter);
+  }
+  const { data, error } = await query;
+  if (error) {
+    console.error("[closings] listClosings failed", error.message);
+    throw new Error("تعذّر تحميل قائمة الإقفالات.");
+  }
+  return ((data ?? []) as ClosingRow[]).map(mapRow);
+}
+
+export async function getClosing(
+  id: string,
+): Promise<ClosingWithBranch | null> {
+  if (!isSupabaseConfigured) return null;
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from("daily_closings")
+    .select("*, branches(name, city)")
+    .eq("id", id)
+    .maybeSingle();
+  if (error) {
+    console.error("[closings] getClosing failed", error.message);
+    throw new Error("تعذّر تحميل بيانات الإقفال.");
+  }
+  if (!data) return null;
+  return mapRow(data as ClosingRow);
+}
+
+export async function countPendingClosings(): Promise<number> {
+  if (!isSupabaseConfigured) return 0;
+  const supabase = getSupabase();
+  const { count, error } = await supabase
+    .from("daily_closings")
+    .select("id", { count: "exact", head: true })
+    .eq("status", "pending");
+  if (error) {
+    console.error("[closings] countPendingClosings failed", error.message);
+    return 0;
+  }
+  return count ?? 0;
+}
+
+export async function listAuditLogs(filters?: {
+  closingId?: string;
+  action?: AuditAction;
+}): Promise<DailyClosingAuditLog[]> {
+  if (!isSupabaseConfigured) return [];
+  const supabase = getSupabase();
+  let query = supabase
+    .from("daily_closing_audit_logs")
+    .select("*")
+    .order("timestamp", { ascending: false })
+    .limit(500);
+  if (filters?.closingId && filters.closingId.trim()) {
+    query = query.eq("closing_id", filters.closingId.trim());
+  }
+  if (filters?.action) {
+    query = query.eq("action", filters.action);
+  }
+  const { data, error } = await query;
+  if (error) {
+    console.error("[closings] listAuditLogs failed", error.message);
+    throw new Error("تعذّر تحميل سجل التدقيق.");
+  }
+  return ((data ?? []) as AuditLogRow[]).map((r) => ({
+    id: r.id,
+    closingId: r.closing_id,
+    actorRole: r.actor_role as UserRole,
+    actorId: r.actor_id ?? undefined,
+    action: r.action as AuditAction,
+    comment: r.comment ?? undefined,
+    timestamp: r.timestamp,
+  }));
+}
+
+export async function approveClosing(
+  id: string,
+  comment?: string,
+  auditorId?: string,
+): Promise<void> {
+  if (!isSupabaseConfigured) {
+    throw new Error("لم يتم إعداد Supabase بعد.");
+  }
+  const supabase = getSupabase();
+  const now = new Date().toISOString();
+  const trimmed = comment?.trim();
+  const { error } = await supabase
+    .from("daily_closings")
+    .update({
+      status: "approved",
+      auditor_comment: trimmed ? trimmed : null,
+      auditor_id: auditorId ?? null,
+      auditor_reviewed_at: now,
+      updated_at: now,
+    })
+    .eq("id", id);
+  if (error) {
+    console.error("[closings] approve update failed", error.message);
+    throw new Error("تعذّر تحديث حالة الإقفال.");
+  }
+  const { error: auditError } = await supabase
+    .from("daily_closing_audit_logs")
+    .insert({
+      closing_id: id,
+      actor_role: "auditor",
+      actor_id: auditorId ?? null,
+      action: "approved",
+      comment: trimmed ? trimmed : null,
+    });
+  if (auditError) {
+    console.error(
+      "[closings] approve audit insert failed",
+      auditError.message,
+    );
+    throw new Error(
+      "تم تحديث حالة الإقفال إلى «معتمد»، لكن تعذّر تسجيل سجل التدقيق.",
+    );
+  }
+}
+
+export async function rejectClosing(
+  id: string,
+  comment: string,
+  auditorId?: string,
+): Promise<void> {
+  if (!isSupabaseConfigured) {
+    throw new Error("لم يتم إعداد Supabase بعد.");
+  }
+  const trimmed = comment.trim();
+  if (!trimmed) {
+    throw new Error("سبب الرفض مطلوب.");
+  }
+  const supabase = getSupabase();
+  const now = new Date().toISOString();
+  const { error } = await supabase
+    .from("daily_closings")
+    .update({
+      status: "rejected",
+      auditor_comment: trimmed,
+      auditor_id: auditorId ?? null,
+      auditor_reviewed_at: now,
+      updated_at: now,
+    })
+    .eq("id", id);
+  if (error) {
+    console.error("[closings] reject update failed", error.message);
+    throw new Error("تعذّر تحديث حالة الإقفال.");
+  }
+  const { error: auditError } = await supabase
+    .from("daily_closing_audit_logs")
+    .insert({
+      closing_id: id,
+      actor_role: "auditor",
+      actor_id: auditorId ?? null,
+      action: "rejected",
+      comment: trimmed,
+    });
+  if (auditError) {
+    console.error(
+      "[closings] reject audit insert failed",
+      auditError.message,
+    );
+    throw new Error(
+      "تم تحديث حالة الإقفال إلى «مرفوض»، لكن تعذّر تسجيل سجل التدقيق.",
+    );
+  }
 }
