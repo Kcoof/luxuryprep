@@ -1,0 +1,573 @@
+--- /dev/null
++++ b/lib/types.ts
+@@ -0,0 +1,38 @@
++export type Branch = { id: string; name: string; city?: string };
++
++export type ClosingImage = {
++  name: string;
++  size: number;
++  dataUrl?: string;
++  url?: string;
++};
++
++export type FinancialFields = {
++  cashSystem: number;
++  cashActualHanded: number;
++  mada: number;
++  visa: number;
++  bankDeposit: number;
++  expenses: number;
++  notes?: string;
++};
++
++export type ClosingStatus = 'pending' | 'approved' | 'rejected';
++
++export type ClosingRecord = {
++  id: string;
++  branchId: string;
++  branchName: string;
++  businessDate: string;
++  fields: FinancialFields;
++  shortageOrExcess: number;
++  status: ClosingStatus;
++  createdAt: string;
++  manualActualCash?: number;
++  images?: {
++    zReport?: ClosingImage;
++    mada?: ClosingImage;
++    cash?: ClosingImage;
++    visa?: ClosingImage;
++  };
++};
+--- /dev/null
++++ b/lib/branch-store.ts
+@@ -0,0 +1,20 @@
++import type { Branch } from './types';
++import seedBranches from '../supabase/seed_branches.json';
++
++export async function loadBranches(): Promise<Branch[]> {
++  try {
++    const { getSupabase } = await import('./supabase');
++    const supabase = getSupabase();
++    if (supabase) {
++      const { data, error } = await supabase
++        .from('branches')
++        .select('id, name, city');
++      if (!error && data && data.length > 0) {
++        return (data as Branch[]).map((b) => ({ id: b.id, name: b.name, city: b.city ?? '' }));
++      }
++    }
++  } catch (e) {
++    console.warn('loadBranches Supabase fallback to seed', e);
++  }
++  return seedBranches as Branch[];
++}
+--- /dev/null
++++ b/lib/closing-store.ts
+@@ -0,0 +1,118 @@
++import type { ClosingRecord, FinancialFields } from './types';
++
++const LS_KEY = 'm2_closings_queue';
++const BRANCH_KEY = 'm2_branch_session';
++
++export function loadSessionBranch(): { id: string; name: string } | null {
++  try {
++    const raw = typeof window !== 'undefined' ? window.localStorage.getItem(BRANCH_KEY) : null;
++    return raw ? (JSON.parse(raw) as { id: string; name: string }) : null;
++  } catch {
++    return null;
++  }
++}
++
++export function saveSessionBranch(b: { id: string; name: string }) {
++  try {
++    window.localStorage.setItem(BRANCH_KEY, JSON.stringify(b));
++  } catch {
++    /* ignore */
++  }
++}
++
++export function clearSessionBranch() {
++  try {
++    window.localStorage.removeItem(BRANCH_KEY);
++  } catch {
++    /* ignore */
++  }
++}
++
++export function computeShortage(f: FinancialFields): number {
++  return (f.cashActualHanded || 0) - (f.cashSystem || 0);
++}
++
++function readLocal(): ClosingRecord[] {
++  try {
++    const raw = window.localStorage.getItem(LS_KEY);
++    return raw ? (JSON.parse(raw) as ClosingRecord[]) : [];
++  } catch {
++    return [];
++  }
++}
++
++function writeLocal(items: ClosingRecord[]) {
++  try {
++    window.localStorage.setItem(LS_KEY, JSON.stringify(items));
++  } catch {
++    /* ignore */
++  }
++}
++
++function mapRow(row: Record<string, unknown>): ClosingRecord {
++  return {
++    id: String(row.id ?? ''),
++    branchId: String(row.branch_id ?? ''),
++    branchName: String(row.branch_name ?? ''),
++    businessDate: String(row.business_date ?? ''),
++    fields: (row.fields as ClosingRecord['fields']) ?? {
++      cashSystem: 0, cashActualHanded: 0, mada: 0, visa: 0, bankDeposit: 0, expenses: 0,
++    },
++    shortageOrExcess: Number(row.shortage_or_excess ?? 0),
++    status: (row.status as ClosingRecord['status']) ?? 'pending',
++    createdAt: String(row.created_at ?? new Date().toISOString()),
++  };
++}
++
++export async function findExistingClosing(
++  branchId: string,
++  businessDate: string
++): Promise<ClosingRecord | null> {
++  try {
++    const { getSupabase } = await import('./supabase');
++    const supabase = getSupabase();
++    if (supabase) {
++      const { data } = await supabase
++        .from('daily_closings')
++        .select('*')
++        .eq('branch_id', branchId)
++        .eq('business_date', businessDate)
++        .maybeSingle();
++      if (data) return mapRow(data as Record<string, unknown>);
++    }
++  } catch (e) {
++    console.warn('findExistingClosing Supabase failed, using local', e);
++  }
++  const all = readLocal();
++  return all.find((c) => c.branchId === branchId && c.businessDate === businessDate) ?? null;
++}
++
++export async function saveClosing(rec: ClosingRecord): Promise<void> {
++  try {
++    const { getSupabase } = await import('./supabase');
++    const supabase = getSupabase();
++    if (supabase) {
++      const { error } = await supabase.from('daily_closings').upsert({
++        id: rec.id,
++        branch_id: rec.branchId,
++        branch_name: rec.branchName,
++        business_date: rec.businessDate,
++        fields: rec.fields,
++        shortage_or_excess: rec.shortageOrExcess,
++        status: rec.status,
++        manual_actual_cash: rec.manualActualCash ?? null,
++        images: rec.images ?? null,
++        created_at: rec.createdAt,
++      });
++      if (!error) return;
++      console.warn('saveClosing Supabase error', error);
++    }
++  } catch (e) {
++    console.warn('saveClosing fallback to local', e);
++  }
++  const all = readLocal();
++  const idx = all.findIndex(
++    (c) => c.branchId === rec.branchId && c.businessDate === rec.businessDate
++  );
++  if (idx >= 0) all[idx] = rec;
++  else all.push(rec);
++  writeLocal(all);
++}
+--- /dev/null
++++ b/supabase/migrations/002_daily_closings.sql
+@@ -0,0 +1,24 @@
++-- 002_daily_closings.sql
++-- M2 Cashier flow: store daily closing submissions.
++-- Storage bucket for proof images: closing-images (create via Supabase Studio if not present).
++
++create table if not exists public.daily_closings (
++  id text primary key,
++  branch_id text not null references public.branches(id) on delete cascade,
++  branch_name text not null,
++  business_date date not null,
++  fields jsonb not null default '{}'::jsonb,
++  shortage_or_excess numeric not null default 0,
++  status text not null default 'pending' check (status in ('pending','approved','rejected')),
++  manual_actual_cash numeric,
++  images jsonb,
++  created_at timestamptz not null default now()
++);
++
++create index if not exists daily_closings_branch_date_idx
++  on public.daily_closings (branch_id, business_date);
++
++alter table public.daily_closings enable row level security;
++
++-- TODO(M4): add RLS policies for cashier vs auditor roles.
++-- Storage bucket "closing-images" should be private; presigned URLs issued server-side.
+--- a/app/cashier/page.tsx
++++ b/app/cashier/page.tsx
+@@ -1,7 +1,348 @@
+-export default function CashierPage() {
+-  return (
+-    <main>
+-      <h1>Cashier</h1>
+-    </main>
+-  );
+-}
++'use client';
++
++import { useEffect, useMemo, useState } from 'react';
++import Link from 'next/link';
++import type { Branch, ClosingImage, ClosingRecord, FinancialFields } from '@/lib/types';
++import { loadBranches } from '@/lib/branch-store';
++import {
++  loadSessionBranch,
++  saveSessionBranch,
++  clearSessionBranch,
++  computeShortage,
++  findExistingClosing,
++  saveClosing,
++} from '@/lib/closing-store';
++
++type Step = 1 | 2 | 3;
++
++export default function CashierPage() {
++  const [branches, setBranches] = useState<Branch[]>([]);
++  const [branch, setBranch] = useState<{ id: string; name: string } | null>(null);
++  const [isBranchLocked, setIsBranchLocked] = useState(false);
++  const [branchMenuOpen, setBranchMenuOpen] = useState(false);
++  const [step, setStep] = useState<Step>(1);
++  const [businessDate, setBusinessDate] = useState(
++    () => new Date().toISOString().slice(0, 10)
++  );
++  const [zReport, setZReport] = useState<ClosingImage | null>(null);
++  const [madaImg, setMadaImg] = useState<ClosingImage | null>(null);
++  const [cashImg, setCashImg] = useState<ClosingImage | null>(null);
++  const [visaImg, setVisaImg] = useState<ClosingImage | null>(null);
++  const [manualActualCash, setManualActualCash] = useState('');
++  const [fields, setFields] = useState<FinancialFields>({
++    cashSystem: 0,
++    cashActualHanded: 0,
++    mada: 0,
++    visa: 0,
++    bankDeposit: 0,
++    expenses: 0,
++    notes: '',
++  });
++  const [existingClosing, setExistingClosing] = useState<ClosingRecord | null>(null);
++  const [confirmOverwrite, setConfirmOverwrite] = useState(false);
++  const [isSaving, setIsSaving] = useState(false);
++  const [savedRecord, setSavedRecord] = useState<ClosingRecord | null>(null);
++
++  useEffect(() => {
++    loadBranches().then(setBranches);
++    const sess = loadSessionBranch();
++    if (sess) {
++      setBranch(sess);
++      setIsBranchLocked(true);
++    }
++  }, []);
++
++  const shortage = useMemo(() => computeShortage(fields), [fields]);
++
++  function pickBranch(b: Branch) {
++    const next = { id: b.id, name: b.name };
++    setBranch(next);
++    saveSessionBranch(next);
++    setIsBranchLocked(true);
++    setBranchMenuOpen(false);
++  }
++
++  function confirmChangeBranch() {
++    if (window.confirm('هل تريد تغيير الفرع؟ سيتم إلغاء الجلسة الحالية.')) {
++      setIsBranchLocked(false);
++      setBranch(null);
++      clearSessionBranch();
++      setStep(1);
++      setSavedRecord(null);
++    }
++  }
++
++  async function checkDuplicate() {
++    if (!branch || !businessDate) return;
++    const existing = await findExistingClosing(branch.id, businessDate);
++    setExistingClosing(existing);
++  }
++
++  function toImage(file: File): Promise<ClosingImage> {
++    return new Promise((resolve, reject) => {
++      const reader = new FileReader();
++      reader.onload = () =>
++        resolve({ name: file.name, size: file.size, dataUrl: String(reader.result) });
++      reader.onerror = reject;
++      reader.readAsDataURL(file);
++    });
++  }
++
++  async function handleFile(
++    setter: (i: ClosingImage | null) => void,
++    file?: File
++  ) {
++    if (!file) return setter(null);
++    setter(await toImage(file));
++  }
++
++  async function goStep2() {
++    if (manualActualCash && !fields.cashActualHanded) {
++      setFields((f) => ({ ...f, cashActualHanded: Number(manualActualCash) || 0 }));
++    }
++    await checkDuplicate();
++    setStep(2);
++  }
++
++  function startSave() {
++    if (existingClosing && !confirmOverwrite) {
++      const ok = window.confirm(
++        'يوجد إغلاق سابق لهذا الفرع في نفس اليوم. هل تريد الاستمرار وتحديثه؟'
++      );
++      if (!ok) return;
++      setConfirmOverwrite(true);
++    }
++    void doSave();
++  }
++
++  async function doSave() {
++    if (!branch) return;
++    setIsSaving(true);
++    try {
++      const rec: ClosingRecord = {
++        id: `close-${Date.now()}`,
++        branchId: branch.id,
++        branchName: branch.name,
++        businessDate,
++        fields,
++        shortageOrExcess: shortage,
++        status: 'pending',
++        createdAt: new Date().toISOString(),
++        manualActualCash: Number(manualActualCash) || undefined,
++        images: {
++          zReport: zReport || undefined,
++          mada: madaImg || undefined,
++          cash: cashImg || undefined,
++          visa: visaImg || undefined,
++        },
++      };
++      await saveClosing(rec);
++      setSavedRecord(rec);
++      setStep(3);
++    } finally {
++      setIsSaving(false);
++    }
++  }
++
++  function resetAll() {
++    setStep(1);
++    setSavedRecord(null);
++    setZReport(null);
++    setMadaImg(null);
++    setCashImg(null);
++    setVisaImg(null);
++    setManualActualCash('');
++    setFields({
++      cashSystem: 0,
++      cashActualHanded: 0,
++      mada: 0,
++      visa: 0,
++      bankDeposit: 0,
++      expenses: 0,
++      notes: '',
++    });
++    setExistingClosing(null);
++    setConfirmOverwrite(false);
++  }
++
++  if (!branch || !isBranchLocked) {
++    return (
++      <main className="mx-auto max-w-3xl px-4 py-8" dir="rtl">
++        <h1 className="mb-4 text-2xl font-bold">اختيار الفرع</h1>
++        <p className="mb-4 text-sm text-neutral-600">اختر الفرع لبدء الإغلاق اليومي.</p>
++        <div className="grid gap-2">
++          {branches.map((b) => (
++            <button
++              key={b.id}
++              onClick={() => pickBranch(b)}
++              className="rounded-lg border border-neutral-200 bg-white p-3 text-start hover:border-neutral-400"
++            >
++              <span className="font-mono text-xs text-neutral-500">{b.id}</span>{' '}
++              <span className="font-medium">{b.name}</span>
++              {b.city ? <span className="text-xs text-neutral-500"> — {b.city}</span> : null}
++            </button>
++          ))}
++        </div>
++      </main>
++    );
++  }
++
++  return (
++    <main className="mx-auto max-w-3xl px-4 py-8" dir="rtl">
++      <div className="mb-6 flex items-center justify-between gap-3 rounded-lg border border-neutral-200 bg-white p-3">
++        <div>
++          <div className="text-xs text-neutral-500">الفرع المحدد</div>
++          <div className="font-medium">
++            {branch.name} <span className="font-mono text-xs text-neutral-500">({branch.id})</span>
++          </div>
++        </div>
++        <button
++          onClick={confirmChangeBranch}
++          className="rounded-md border border-neutral-300 px-3 py-1 text-sm hover:bg-neutral-50"
++        >
++          تغيير الفرع
++        </button>
++      </div>
++
++      <ol className="mb-6 flex gap-2 text-xs">
++        <li className={step >= 1 ? 'font-bold' : ''}>1. الرفع والالتقاط</li>
++        <li>›</li>
++        <li className={step >= 2 ? 'font-bold' : ''}>2. مراجعة الأرقام</li>
++        <li>›</li>
++        <li className={step >= 3 ? 'font-bold' : ''}>3. التأكيد</li>
++      </ol>
++
++      {step === 1 && (
++        <section className="space-y-4">
++          <div>
++            <label className="mb-1 block text-sm font-medium">التاريخ التجاري</label>
++            <input
++              type="date"
++              value={businessDate}
++              onChange={(e) => setBusinessDate(e.target.value)}
++              className="w-full rounded-md border border-neutral-300 px-3 py-2"
++            />
++          </div>
++          <FileInput label="صورة تقرير Z الرئيسي *" onFile={(f) => handleFile(setZReport, f)} />
++          <FileInput label="إثبات مدى (اختياري)" onFile={(f) => handleFile(setMadaImg, f)} />
++          <FileInput label="إثبات إيداع نقدي (اختياري)" onFile={(f) => handleFile(setCashImg, f)} />
++          <FileInput label="إثبات Visa (اختياري)" onFile={(f) => handleFile(setVisaImg, f)} />
++          <div>
++            <label className="mb-1 block text-sm font-medium">النقد الفعلي اليدوي (اختياري)</label>
++            <input
++              type="number"
++              inputMode="decimal"
++              value={manualActualCash}
++              onChange={(e) => setManualActualCash(e.target.value)}
++              className="w-full rounded-md border border-neutral-300 px-3 py-2"
++              placeholder="0.00"
++            />
++          </div>
++          <div className="flex justify-end gap-2">
++            <button
++              onClick={goStep2}
++              disabled={!zReport}
++              className="rounded-md bg-neutral-900 px-4 py-2 text-white disabled:opacity-50"
++            >
++              التالي
++            </button>
++          </div>
++        </section>
++      )}
++
++      {step === 2 && (
++        <section className="space-y-4">
++          {existingClosing && (
++            <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-800">
++              يوجد إغلاق سابق لهذا الفرع في نفس اليوم. سيتم التحديث عند الحف��.
++            </div>
++          )}
++          <div className="grid grid-cols-2 gap-3">
++            <NumInput label="نقد النظام" value={fields.cashSystem} onChange={(v) => setFields((f) => ({ ...f, cashSystem: v }))} />
++            <NumInput label="نقد مسلّم فعلي" value={fields.cashActualHanded} onChange={(v) => setFields((f) => ({ ...f, cashActualHanded: v }))} />
++            <NumInput label="مدى" value={fields.mada} onChange={(v) => setFields((f) => ({ ...f, mada: v }))} />
++            <NumInput label="Visa" value={fields.visa} onChange={(v) => setFields((f) => ({ ...f, visa: v }))} />
++            <NumInput label="إيداع بنكي" value={fields.bankDeposit} onChange={(v) => setFields((f) => ({ ...f, bankDeposit: v }))} />
++            <NumInput label="مصروفات" value={fields.expenses} onChange={(v) => setFields((f) => ({ ...f, expenses: v }))} />
++          </div>
++          <div className="rounded-md border border-neutral-200 bg-neutral-50 p-3">
++            <div className="text-xs text-neutral-500">العجز / الزيادة</div>
++            <div className={shortage < 0 ? 'font-bold text-red-600' : 'font-bold text-green-700'}>
++              {shortage.toLocaleString('ar-SA')} ر.س
++            </div>
++          </div>
++          <textarea
++            placeholder="ملاحظات (اختياري)"
++            value={fields.notes}
++            onChange={(e) => setFields((f) => ({ ...f, notes: e.target.value }))}
++            className="w-full rounded-md border border-neutral-300 px-3 py-2"
++            rows={2}
++          />
++          <div className="flex justify-between gap-2">
++            <button onClick={() => setStep(1)} className="rounded-md border border-neutral-300 px-4 py-2">رجوع</button>
++            <button
++              onClick={startSave}
++              disabled={isSaving}
++              className="rounded-md bg-neutral-900 px-4 py-2 text-white disabled:opacity-50"
++            >
++              {isSaving ? 'جارٍ الحفظ…' : 'حفظ الإغلاق'}
++            </button>
++          </div>
++        </section>
++      )}
++
++      {step === 3 && savedRecord && (
++        <section className="space-y-4">
++          <div className="rounded-md border border-green-300 bg-green-50 p-4 text-center">
++            <div className="text-lg font-bold text-green-800">تم حفظ الإغلاق</div>
++            <div className="mt-1 font-mono text-xs text-neutral-600">{savedRecord.id}</div>
++            <div className="mt-2 inline-block rounded-full bg-amber-100 px-3 py-1 text-xs text-amber-800">
++              بانتظار اعتماد الإدارة المالية
++            </div>
++          </div>
++          <div className="flex justify-between gap-2">
++            <Link href="/" className="rounded-md border border-neutral-300 px-4 py-2">الصفحة الرئيسية</Link>
++            <button onClick={resetAll} className="rounded-md bg-neutral-900 px-4 py-2 text-white">إغلاق جديد</button>
++          </div>
++        </section>
++      )}
++    </main>
++  );
++}
++
++function FileInput({ label, onFile }: { label: string; onFile: (f?: File) => void }) {
++  return (
++    <div>
++      <label className="mb-1 block text-sm font-medium">{label}</label>
++      <input
++        type="file"
++        accept="image/*"
++        onChange={(e) => onFile(e.target.files?.[0])}
++        className="block w-full text-sm"
++      />
++    </div>
++  );
++}
++
++function NumInput({
++  label,
++  value,
++  onChange,
++}: {
++  label: string;
++  value: number;
++  onChange: (v: number) => void;
++}) {
++  return (
++    <label className="block">
++      <span className="mb-1 block text-xs font-medium">{label}</span>
++      <input
++        type="number"
++        inputMode="decimal"
++        value={Number.isFinite(value) ? value : 0}
++        onChange={(e) => onChange(Number(e.target.value) || 0)}
++        className="w-full rounded-md border border-neutral-300 px-3 py-2"
++      />
++    </label>
++  );
++}
+END_DIFF

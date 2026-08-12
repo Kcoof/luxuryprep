@@ -1,0 +1,661 @@
+diff --git a/app/types/index.ts b/app/types/index.ts
+--- a/app/types/index.ts
++++ b/app/types/index.ts
+@@ -88,3 +88,8 @@
+   const actual = Number.isFinite(cashActualHanded) ? cashActualHanded : 0;
+   const system = Number.isFinite(cashSystem) ? cashSystem : 0;
+   return Number((actual - system).toFixed(2));
+ }
++
++export const FINANCIAL_FIELD_LABELS: Record<keyof FinancialFields, string> = {
++  grossSales: "إجمالي المبيعات",
++  netSales: "صافي المبيعات",
++  cashSystem: "النقدية في النظام",
++  cashActualHanded: "النقدية المسلّمة فعليًا",
++  spanSystem: "سبان",
++  deliveryAppsSystem: "تطبيقات التوصيل",
++  reversedTransactions: "حركات معكوسة",
++  shortageOrExcess: "عجز / زيادة",
++};
+diff --git a/app/lib/branches.ts b/app/lib/branches.ts
+--- /dev/null
++++ b/app/lib/branches.ts
+@@ -0,0 +1,48 @@
++"use client";
++
++import seedBranches from "../../supabase/seed_branches.json";
++import type { Branch } from "../types";
++import { getSupabase, isSupabaseConfigured } from "./supabase";
++
++export function getSeedBranches(): Branch[] {
++  return (seedBranches as Branch[]).map((b) => ({
++    id: b.id,
++    name: b.name,
++    city: b.city ?? "",
++  }));
++}
++
++export async function listBranches(): Promise<Branch[]> {
++  if (!isSupabaseConfigured) {
++    return getSeedBranches();
++  }
++  try {
++    const supabase = getSupabase();
++    const { data, error } = await supabase
++      .from("branches")
++      .select("id, name, city")
++      .order("id", { ascending: true });
++    if (error || !data || data.length === 0) {
++      return getSeedBranches();
++    }
++    return data as Branch[];
++  } catch {
++    return getSeedBranches();
++  }
++}
++
++export function findBranch(branches: Branch[], id?: string): Branch | undefined {
++  if (!id) return undefined;
++  return branches.find((b) => b.id === id);
++}
+diff --git a/app/lib/closings.ts b/app/lib/closings.ts
+--- /dev/null
++++ b/app/lib/closings.ts
+@@ -0,0 +1,80 @@
++"use client";
++
++import type {
++  AuditAction,
++  DailyClosing,
++  DailyClosingAuditLog,
++  FinancialFields,
++  UserRole,
++} from "../types";
++import { computeShortageOrExcess } from "../types";
++import { getSupabase, isSupabaseConfigured } from "./supabase";
++
++export interface NewClosingInput {
++  branchId: string;
++  businessDate: string;
++  reviewedData: FinancialFields;
++  zReportImageUrl?: string;
++  paymentProofImageUrls?: string[];
++  manualActualCash?: number;
++}
++
++export async function createClosing(
++  input: NewClosingInput,
++): Promise<{ ok: boolean; closing?: DailyClosing; error?: string }> {
++  const payload = buildClosingPayload(input);
++  if (!isSupabaseConfigured) {
++    const closing = makeLocalClosing(payload);
++    return { ok: true, closing };
++  }
++  try {
++    const supabase = getSupabase();
++    const { data, error } = await supabase
++      .from("daily_closings")
++      .insert(payload)
++      .select()
++      .single();
++    if (error) return { ok: false, error: error.message };
++    await appendAuditLog(supabase, data.id, "cashier", undefined, "cashier_confirmed");
++    return { ok: true, closing: data as DailyClosing };
++  } catch (e) {
++    return { ok: false, error: (e as Error).message };
++  }
++}
++
++function buildClosingPayload(input: NewClosingInput) {
++  const shortage = computeShortageOrExcess(
++    input.reviewedData.cashActualHanded,
++    input.reviewedData.cashSystem,
++  );
++  return {
++    branch_id: input.branchId,
++    business_date: input.businessDate,
++    status: "pending" as const,
++    z_report_image_url: input.zReportImageUrl ?? null,
++    payment_proof_image_urls: input.paymentProofImageUrls ?? [],
++    reviewed_data: { ...input.reviewedData, shortageOrExcess: shortage },
++    manual_actual_cash: input.manualActualCash ?? null,
++  };
++}
++
++function makeLocalClosing(payload: ReturnType<typeof buildClosingPayload>): DailyClosing {
++  const now = new Date().toISOString();
++  return {
++    id: `local_${Date.now()}`,
++    branchId: payload.branch_id,
++    businessDate: payload.business_date,
++    status: "pending",
++    zReportImageUrl: payload.z_report_image_url ?? undefined,
++    paymentProofImageUrls: payload.payment_proof_image_urls ?? [],
++    reviewedData: payload.reviewed_data,
++    manualActualCash: payload.manual_actual_cash ?? undefined,
++    createdAt: now,
++    updatedAt: now,
++  };
++}
++
++async function appendAuditLog(
++  supabase: ReturnType<typeof getSupabase>,
++  closingId: string,
++  role: UserRole,
++  actorId: string | undefined,
++  action: AuditAction,
++) {
++  await supabase.from("daily_closing_audit_logs").insert({
++    closing_id: closingId,
++    actor_role: role,
++    actor_id: actorId ?? null,
++    action,
++  });
++}
+diff --git a/app/cashier/page.tsx b/app/cashier/page.tsx
+--- a/app/cashier/page.tsx
++++ b/app/cashier/page.tsx
+@@ -1,19 +1,209 @@
+-import Link from "next/link";
+-import { ArrowRight, Calculator } from "lucide-react";
+-
+-export default function CashierPage() {
+-  return (
+-    <main className="mx-auto max-w-3xl px-4 py-10">
+-      <Link
+-        href="/"
+-        className="mb-6 inline-flex items-center gap-1 text-sm text-slate-600 hover:text-slate-900"
+-      >
+-        <ArrowRight className="h-4 w-4" />
+-        العودة للرئيسية
+-      </Link>
+-
+-      <div className="card-frame p-8 text-center">
+-        <Calculator className="mx-auto h-10 w-10 text-emerald-600" />
+-        <h1 className="mt-4 text-2xl font-bold">شاشة الكاشير</h1>
+-        <p className="mt-2 text-slate-600">هيكل M1 — سيتوفر المعالج ثلاثي الخطوات في M2.</p>
+-      </div>
+-    </main>
+-  );
+-}
++"use client";
++
++import Link from "next/link";
++import { useMemo, useState } from "react";
++import { ArrowRight, Calculator, Check, Upload } from "lucide-react";
++import type { Branch, FinancialFields } from "../types";
++import {
++  EMPTY_FINANCIAL_FIELDS,
++  FINANCIAL_FIELD_LABELS,
++  computeShortageOrExcess,
++} from "../types";
++import { listBranches } from "../lib/branches";
++import { createClosing } from "../lib/closings";
++
++type Step = 1 | 2 | 3;
++
++export default function CashierPage() {
++  const [step, setStep] = useState<Step>(1);
++  const [branches, setBranches] = useState<Branch[]>([]);
++  const [branchesLoaded, setBranchesLoaded] = useState(false);
++  const [branchId, setBranchId] = useState("");
++  const [businessDate, setBusinessDate] = useState(
++    new Date().toISOString().slice(0, 10),
++  );
++  const [fields, setFields] = useState<FinancialFields>({ ...EMPTY_FINANCIAL_FIELDS });
++  const [zReportImage, setZReportImage] = useState<File | null>(null);
++  const [proofImages, setProofImages] = useState<File[]>([]);
++  const [submitting, setSubmitting] = useState(false);
++  const [result, setResult] = useState<{ ok: boolean; message: string } | null>(null);
++
++  useMemo(() => {
++    if (!branchesLoaded) {
++      listBranches().then((b) => {
++        setBranches(b);
++        setBranchesLoaded(true);
++      });
++    }
++  }, [branchesLoaded]);
++
++  const shortage = computeShortageOrExcess(fields.cashActualHanded, fields.cashSystem);
++
++  const updateField = (key: keyof FinancialFields, value: string) => {
++    const num = Number(value);
++    setFields((prev) => ({
++      ...prev,
++      [key]: Number.isFinite(num) ? num : 0,
++      shortageOrExcess:
++        key === "cashActualHanded" || key === "cashSystem"
++          ? computeShortageOrExcess(
++              key === "cashActualHanded" ? num : prev.cashActualHanded,
++              key === "cashSystem" ? num : prev.cashSystem,
++            )
++          : prev.shortageOrExcess,
++    }));
++  };
++
++  const canProceedStep1 = Boolean(branchId && businessDate);
++  const canProceedStep2 =
++    fields.grossSales > 0 || fields.netSales > 0 || fields.cashSystem > 0;
++
++  const submit = async () => {
++    setSubmitting(true);
++    setResult(null);
++    const finalFields: FinancialFields = { ...fields, shortageOrExcess: shortage };
++    const res = await createClosing({
++      branchId,
++      businessDate,
++      reviewedData: finalFields,
++      paymentProofImageUrls: proofImages.map((f) => f.name),
++      zReportImageUrl: zReportImage?.name,
++    });
++    setSubmitting(false);
++    if (res.ok) {
++      setResult({
++        ok: true,
++        message: `تم إرسال الإقفال بنجاح (${res.closing?.id ?? "—"})`,
++      });
++      setStep(3);
++    } else {
++      setResult({ ok: false, message: res.error ?? "تعذّر حفظ الإقفال" });
++    }
++  };
++
++  const reset = () => {
++    setStep(1);
++    setBranchId("");
++    setFields({ ...EMPTY_FINANCIAL_FIELDS });
++    setZReportImage(null);
++    setProofImages([]);
++    setResult(null);
++  };
++
++  return (
++    <main className="mx-auto max-w-3xl px-4 py-10">
++      <Link
++        href="/"
++        className="mb-6 inline-flex items-center gap-1 text-sm text-slate-600 hover:text-slate-900"
++      >
++        <ArrowRight className="h-4 w-4" />
++        العودة للرئيسية
++      </Link>
++
++      <div className="card-frame p-6">
++        <div className="mb-6 flex items-center gap-2">
++          <Calculator className="h-6 w-6 text-emerald-600" />
++          <h1 className="text-2xl font-bold">شاشة الكاشير — الإقفال اليومي</h1>
++        </div>
++
++        <Stepper step={step} />
++
++        {step === 1 && (
++          <Step1
++            branches={branches}
++            branchId={branchId}
++            setBranchId={setBranchId}
++            businessDate={businessDate}
++            setBusinessDate={setBusinessDate}
++            onNext={() => canProceedStep1 && setStep(2)}
++            canNext={canProceedStep1}
++          />
++        )}
++
++        {step === 2 && (
++          <Step2
++            fields={fields}
++            updateField={updateField}
++            shortage={shortage}
++            zReportImage={zReportImage}
++            setZReportImage={setZReportImage}
++            proofImages={proofImages}
++            setProofImages={setProofImages}
++            onBack={() => setStep(1)}
++            onNext={() => canProceedStep2 && setStep(3)}
++            canNext={canProceedStep2}
++          />
++        )}
++
++        {step === 3 && (
++          <Step3
++            branch={branches.find((b) => b.id === branchId)}
++            businessDate={businessDate}
++            fields={fields}
++            shortage={shortage}
++            submitting={submitting}
++            result={result}
++            onBack={() => setStep(2)}
++            onSubmit={submit}
++            onReset={reset}
++          />
++        )}
++      </div>
++    </main>
++  );
++}
++
++function Stepper({ step }: { step: Step }) {
++  const labels = ["بيانات الفرع", "القيم المالية", "المراجعة والإرسال"];
++  return (
++    <ol className="mb-6 flex items-center gap-2 text-sm">
++      {labels.map((label, i) => {
++        const n = (i + 1) as Step;
++        const active = step === n;
++        const done = step > n;
++        return (
++          <li
++            key={label}
++            className={`flex items-center gap-1 rounded-full px-3 py-1 ${
++              active
++                ? "bg-emerald-600 text-white"
++                : done
++                ? "bg-emerald-100 text-emerald-700"
++                : "bg-slate-100 text-slate-500"
++            }`}
++          >
++            <span className="flex h-5 w-5 items-center justify-center rounded-full bg-white/30">
++              {done ? <Check className="h-3 w-3" /> : n}
++            </span>
++            {label}
++          </li>
++        );
++      })}
++    </ol>
++  );
++}
++
++function Step1({
++  branches,
++  branchId,
++  setBranchId,
++  businessDate,
++  setBusinessDate,
++  onNext,
++  canNext,
++}: {
++  branches: Branch[];
++  branchId: string;
++  setBranchId: (v: string) => void;
++  businessDate: string;
++  setBusinessDate: (v: string) => void;
++  onNext: () => void;
++  canNext: boolean;
++}) {
++  return (
++    <div className="space-y-4">
++      <div>
++        <label className="mb-1 block text-sm font-medium">الفرع</label>
++        <select
++          value={branchId}
++          onChange={(e) => setBranchId(e.target.value)}
++          className="w-full rounded-lg border border-slate-300 px-3 py-2"
++        >
++          <option value="">— اختر الفرع —</option>
++          {branches.map((b) => (
++            <option key={b.id} value={b.id}>
++              {b.id} — {b.name}
++            </option>
++          ))}
++        </select>
++      </div>
++      <div>
++        <label className="mb-1 block text-sm font-medium">تاريخ اليوم التجاري</label>
++        <input
++          type="date"
++          value={businessDate}
++          onChange={(e) => setBusinessDate(e.target.value)}
++          className="w-full rounded-lg border border-slate-300 px-3 py-2"
++        />
++      </div>
++      <div className="flex justify-end">
++        <button
++          onClick={onNext}
++          disabled={!canNext}
++          className="rounded-lg bg-emerald-600 px-4 py-2 text-white disabled:opacity-50"
++        >
++          التالي
++        </button>
++      </div>
++    </div>
++  );
++}
++
++function Step2({
++  fields,
++  updateField,
++  shortage,
++  zReportImage,
++  setZReportImage,
++  proofImages,
++  setProofImages,
++  onBack,
++  onNext,
++  canNext,
++}: {
++  fields: FinancialFields;
++  updateField: (k: keyof FinancialFields, v: string) => void;
++  shortage: number;
++  zReportImage: File | null;
++  setZReportImage: (f: File | null) => void;
++  proofImages: File[];
++  setProofImages: (f: File[]) => void;
++  onBack: () => void;
++  onNext: () => void;
++  canNext: boolean;
++}) {
++  const editableKeys = [
++    "grossSales",
++    "netSales",
++    "cashSystem",
++    "cashActualHanded",
++    "spanSystem",
++    "deliveryAppsSystem",
++    "reversedTransactions",
++  ] as const;
++
++  return (
++    <div className="space-y-4">
++      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
++        {editableKeys.map((key) => (
++          <div key={key}>
++            <label className="mb-1 block text-sm font-medium">
++              {FINANCIAL_FIELD_LABELS[key]}
++            </label>
++            <input
++              type="number"
++              inputMode="decimal"
++              value={fields[key]}
++              onChange={(e) => updateField(key, e.target.value)}
++              className="w-full rounded-lg border border-slate-300 px-3 py-2"
++            />
++          </div>
++        ))}
++      </div>
++      <div className="rounded-lg bg-slate-50 p-3 text-sm">
++        <span className="text-slate-500">عجز / زيادة محسوب: </span>
++        <span
++          className={`font-bold ${
++            shortage < 0 ? "text-rose-600" : shortage > 0 ? "text-emerald-600" : ""
++          }`}
++        >
++          {shortage.toFixed(2)} ر.س
++        </span>
++      </div>
++      <div>
++        <label className="mb-1 block text-sm font-medium">صورة تقرير Z</label>
++        <input
++          type="file"
++          accept="image/*"
++          onChange={(e) => setZReportImage(e.target.files?.[0] ?? null)}
++          className="block w-full text-sm"
++        />
++      </div>
++      <div>
++        <label className="mb-1 block text-sm font-medium">
++          إثباتات الدفع / التسليم
++        </label>
++        <input
++          type="file"
++          accept="image/*"
++          multiple
++          onChange={(e) => setProofImages(Array.from(e.target.files ?? []))}
++          className="block w-full text-sm"
++        />
++      </div>
++      <div className="flex justify-between">
++        <button
++          onClick={onBack}
++          className="rounded-lg border border-slate-300 px-4 py-2"
++        >
+          رجوع
++        </button>
++        <button
++          onClick={onNext}
++          disabled={!canNext}
++          className="rounded-lg bg-emerald-600 px-4 py-2 text-white disabled:opacity-50"
++        >
++          التالي
++        </button>
++      </div>
++    </div>
++  );
++}
++
++function Step3({
++  branch,
++  businessDate,
++  fields,
++  shortage,
++  submitting,
++  result,
++  onBack,
++  onSubmit,
++  onReset,
++}: {
++  branch?: Branch;
++  businessDate: string;
++  fields: FinancialFields;
++  shortage: number;
++  submitting: boolean;
++  result: { ok: boolean; message: string } | null;
++  onBack: () => void;
++  onSubmit: () => void;
++  onReset: () => void;
++}) {
++  const entries = (Object.keys(fields) as (keyof FinancialFields)[]).filter(
++    (k) => k !== "shortageOrExcess",
++  );
++  return (
++    <div className="space-y-4">
++      <div className="rounded-lg border border-slate-200 p-4">
++        <div className="mb-2 text-sm text-slate-500">الفرع</div>
++        <div className="font-medium">
++          {branch ? `${branch.id} — ${branch.name}` : "—"}
++        </div>
++        <div className="mt-2 mb-2 text-sm text-slate-500">التاريخ</div>
++        <div className="font-medium">{businessDate}</div>
++      </div>
++      <div className="rounded-lg border border-slate-200 p-4">
++        <div className="mb-2 text-sm text-slate-500">الملخص المالي</div>
++        <dl className="grid grid-cols-2 gap-y-1 text-sm">
++          {entries.map((k) => (
++            <div key={k} className="contents">
++              <dt className="text-slate-500">{FINANCIAL_FIELD_LABELS[k]}</dt>
++              <dd className="text-left font-mono">{fields[k].toFixed(2)}</dd>
++            </div>
++          ))}
++          <dt className="text-slate-500">عجز / زيادة</dt>
++          <dd
++            className={`text-left font-mono ${
++              shortage < 0 ? "text-rose-600" : shortage > 0 ? "text-emerald-600" : ""
++            }`}
++          >
++            {shortage.toFixed(2)}
++          </dd>
++        </dl>
++      </div>
++      {result && (
++        <div
++          className={`rounded-lg p-3 text-sm ${
++            result.ok ? "bg-emerald-50 text-emerald-700" : "bg-rose-50 text-rose-700"
++          }`}
++        >
++          {result.message}
++        </div>
++      )}
++      <div className="flex justify-between">
++        <button
++          onClick={onBack}
++          className="rounded-lg border border-slate-300 px-4 py-2"
++          disabled={submitting || result?.ok}
++        >
++          رجوع
++        </button>
++        {result?.ok ? (
++          <button
++            onClick={onReset}
++            className="rounded-lg bg-emerald-600 px-4 py-2 text-white"
++          >
++            إقفال جديد
++          </button>
++        ) : (
++          <button
++            onClick={onSubmit}
+            disabled={submitting}
++            className="inline-flex items-center gap-1 rounded-lg bg-emerald-600 px-4 py-2 text-white disabled:opacity-50"
++          >
++            <Upload className="h-4 w-4" />
++            {submitting ? "جارٍ الإرسال..." : "إرسال للمراجعة"}
++          </button>
++        )}
++      </div>
++    </div>
++  );
++}
+diff --git a/supabase/migrations/002_daily_closings.sql b/supabase/migrations/002_daily_closings.sql
+--- /dev/null
++++ b/supabase/migrations/002_daily_closings.sql
+@@ -0,0 +1,42 @@
++create table if not exists public.daily_closings (
++  id uuid primary key default gen_random_uuid(),
++  branch_id text not null,
++  business_date date not null,
++  status text not null default 'pending'
++    check (status in ('pending','approved','rejected')),
++  z_report_image_url text,
++  payment_proof_image_urls text[] default '{}',
++  ai_extracted_data jsonb,
++  ai_confidence jsonb,
++  reviewed_data jsonb,
++  manually_modified_fields text[] default '{}',
++  manual_actual_cash numeric,
++  auditor_id text,
++  auditor_comment text,
++  auditor_reviewed_at timestamptz,
++  created_at timestamptz not null default now(),
++  updated_at timestamptz not null default now(),
++  unique (branch_id, business_date)
++);
++
++create index if not exists daily_closings_branch_date_idx
++  on public.daily_closings (branch_id, business_date);
++create index if not exists daily_closings_status_idx
++  on public.daily_closings (status);
++
++create table if not exists public.daily_closing_audit_logs (
++  id uuid primary key default gen_random_uuid(),
++  closing_id uuid not null references public.daily_closings(id) on delete cascade,
++  actor_role text not null
++    check (actor_role in ('cashier','manager','auditor','ai')),
++  actor_id text,
++  action text not null
++    check (action in ('uploaded','ai_extracted','cashier_confirmed','approved','rejected','modified')),
++  comment text,
++  timestamp timestamptz not null default now()
++);
++
++create index if not exists daily_closing_audit_logs_closing_idx
++  on public.daily_closing_audit_logs (closing_id);
++
++alter table public.daily_closings enable row level security;
++alter table public.daily_closing_audit_logs enable row level security;
+END_DIFF

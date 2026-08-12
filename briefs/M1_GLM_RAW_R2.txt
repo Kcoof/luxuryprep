@@ -1,0 +1,466 @@
+diff --git a/package.json b/package.json
+new file mode 100644
+--- /dev/null
++++ b/package.json
+@@ -0,0 +1,29 @@
++{
++  "name": "luxuryprep",
++  "version": "0.1.0",
++  "private": true,
++  "scripts": {
++    "dev": "next dev",
++    "build": "next build",
++    "start": "next start"
++  },
++  "dependencies": {
++    "@supabase/supabase-js": "2.45.4",
++    "clsx": "2.1.1",
++    "lucide-react": "0.439.0",
++    "next": "14.2.7",
++    "react": "18.2.0",
++    "react-dom": "18.2.0",
++    "tailwind-merge": "2.5.2",
++    "tailwindcss-animate": "1.0.7"
++  },
++  "devDependencies": {
++    "@types/node": "20.14.10",
++    "@types/react": "18.2.79",
++    "@types/react-dom": "18.2.25",
++    "autoprefixer": "10.4.20",
++    "postcss": "8.4.41",
++    "tailwindcss": "3.4.10",
++    "typescript": "5.5.4"
++  }
++}
+diff --git a/next.config.js b/next.config.js
+new file mode 100644
+--- /dev/null
++++ b/next.config.js
+@@ -0,0 +1,5 @@
++/** @type {import('next').NextConfig} */
++const nextConfig = {
++  reactStrictMode: true,
++};
++module.exports = nextConfig;
+diff --git a/tsconfig.json b/tsconfig.json
+new file mode 100644
+--- /dev/null
++++ b/tsconfig.json
+@@ -0,0 +1,28 @@
++{
++  "compilerOptions": {
++    "target": "ES2020",
++    "lib": ["dom", "dom.iterable", "esnext"],
++    "allowJs": true,
++    "skipLibCheck": true,
++    "strict": true,
++    "noEmit": true,
++    "esModuleInterop": true,
++    "module": "esnext",
++    "moduleResolution": "bundler",
++    "resolveJsonModule": true,
++    "isolatedModules": true,
++    "jsx": "preserve",
++    "incremental": true,
++    "plugins": [{ "name": "next" }],
++    "paths": {
++      "@/*": ["./*"]
++    }
++  },
++  "include": [
++    "next-env.d.ts",
++    "**/*.ts",
++    "**/*.tsx",
++    ".next/types/**/*.ts"
++  ],
++  "exclude": ["node_modules"]
++}
+diff --git a/next-env.d.ts b/next-env.d.ts
+new file mode 100644
+--- /dev/null
++++ b/next-env.d.ts
+@@ -0,0 +1,5 @@
++/// <reference types="next" />
++/// <reference types="next/image-types/global" />
++
++// NOTE: This file should not be edited
++// see https://nextjs.org/docs/basic-features/typescript for more information.
+diff --git a/postcss.config.js b/postcss.config.js
+new file mode 100644
+--- /dev/null
++++ b/postcss.config.js
+@@ -0,0 +1,6 @@
++module.exports = {
++  plugins: {
++    tailwindcss: {},
++    autoprefixer: {},
++  },
++};
+diff --git a/tailwind.config.js b/tailwind.config.js
+new file mode 100644
+--- /dev/null
++++ b/tailwind.config.js
+@@ -0,0 +1,17 @@
++/** @type {import('tailwindcss').Config} */
++module.exports = {
++  content: [
++    "./app/**/*.{js,ts,jsx,tsx,mdx}",
++  ],
++  theme: {
++    extend: {
++      colors: {
++        frame: {
++          DEFAULT: "#0f172a",
++          deep: "#020617",
++        },
++      },
++    },
++  },
++  plugins: [require("tailwindcss-animate")],
++};
+diff --git a/app/globals.css b/app/globals.css
+new file mode 100644
+--- /dev/null
++++ b/app/globals.css
+@@ -0,0 +1,31 @@
++@tailwind base;
++@tailwind components;
++@tailwind utilities;
++
++:root {
++  --background: 248 250 252; /* slate-50 */
++  --foreground: 15 23 42;    /* slate-900 */
++  --frame: 2 6 23;           /* slate-950 */
++  --success: 16 185 129;     /* emerald-500 */
++  --pending: 245 158 11;     /* amber-500 */
++  --danger: 244 63 94;       /* rose-500 */
++}
++
++html,
++body {
++  background-color: rgb(var(--background));
++  color: rgb(var(--foreground));
++  direction: rtl;
++}
++
++body {
++  font-family: "Segoe UI", "Tahoma", system-ui, -apple-system, "Arial",
++    sans-serif;
++}
++
++.card-frame {
++  background-color: #ffffff;
++  border: 1px solid #e2e8f0; /* slate-200 */
++  border-radius: 0.75rem;
++  box-shadow: 0 1px 2px 0 rgba(15, 23, 42, 0.06);
++}
+diff --git a/app/layout.tsx b/app/layout.tsx
+new file mode 100644
+--- /dev/null
++++ b/app/layout.tsx
+@@ -0,0 +1,22 @@
++import type { Metadata } from "next";
++import "./globals.css";
++
++export const metadata: Metadata = {
++  title: "الإغلاق المالي اليومي ومراجعة الفروع",
++  description:
++    "نظام الإغلاق المالي اليومي والمراجعة لفروع التجزئة والمطاعم في المملكة العربية السعودية",
++};
++
++export default function RootLayout({
++  children,
++}: {
++  children: React.ReactNode;
++}) {
++  return (
++    <html lang="ar" dir="rtl">
++      <body className="min-h-screen bg-slate-50 text-slate-900 antialiased">
++        {children}
++      </body>
++    </html>
++  );
++}
+diff --git a/app/page.tsx b/app/page.tsx
+new file mode 100644
+--- /dev/null
++++ b/app/page.tsx
+@@ -0,0 +1,35 @@
++import Link from "next/link";
++import { Calculator, ShieldCheck } from "lucide-react";
++
++export default function HomePage() {
++  return (
++    <main className="mx-auto max-w-3xl px-4 py-10">
++      <header className="mb-8 text-center">
++        <h1 className="text-3xl font-bold text-slate-900">
++          نظام الإغلاق المالي اليومي ومراجعة الفروع
++        </h1>
++        <p className="mt-2 text-slate-600">
++          اختر الشاشة للمتابعة — هياكل M1 فقط (لا توجد ميزات بعد).
++        </p>
++      </header>
++
++      <nav className="grid gap-4 sm:grid-cols-2">
++        <Link
++          href="/cashier"
++          className="card-frame flex items-center gap-3 p-6 hover:border-emerald-400"
++        >
++          <Calculator className="h-8 w-8 text-emerald-600" />
++          <span className="text-lg font-semibold">شاشة الكاشير</span>
++        </Link>
++
++        <Link
++          href="/auditor"
++          className="card-frame flex items-center gap-3 p-6 hover:border-amber-400"
++        >
++          <ShieldCheck className="h-8 w-8 text-amber-600" />
++          <span className="text-lg font-semibold">الإدارة المالية والمراجعة</span>
++        </Link>
++      </nav>
++    </main>
++  );
++}
+diff --git a/app/types/index.ts b/app/types/index.ts
+new file mode 100644
+--- /dev/null
++++ b/app/types/index.ts
+@@ -0,0 +1,95 @@
++// M1 type contracts per FOUNDATION.md
++// Currency: SAR. All numeric fields are decimal monetary values.
++
++export interface Branch {
++  id: string;
++  name: string;
++  city: string;
++}
++
++export interface FinancialFields {
++  grossSales: number;
++  netSales: number;
++  cashSystem: number;
++  cashActualHanded: number;
++  spanSystem: number;
++  deliveryAppsSystem: number;
++  reversedTransactions: number;
++  shortageOrExcess: number;
++}
++
++export type FieldConfidence = {
++  grossSales?: number;
++  netSales?: number;
++  cashSystem?: number;
++  cashActualHanded?: number;
++  spanSystem?: number;
++  deliveryAppsSystem?: number;
++  reversedTransactions?: number;
++  shortageOrExcess?: number;
++};
++
++export type ClosingStatus = "pending" | "approved" | "rejected";
++
++export type UserRole = "cashier" | "manager" | "auditor" | "ai";
++
++export type AuditAction =
++  | "uploaded"
++  | "ai_extracted"
++  | "cashier_confirmed"
++  | "approved"
++  | "rejected"
++  | "modified";
++
++export interface DailyClosing {
++  id: string;
++  branchId: string;
++  businessDate: string; // ISO date (yyyy-mm-dd)
++  status: ClosingStatus;
++  zReportImageUrl?: string;
++  paymentProofImageUrls?: string[];
++  aiExtractedData?: Partial<FinancialFields>;
++  aiConfidence?: FieldConfidence;
++  reviewedData?: Partial<FinancialFields>;
++  manuallyModifiedFields?: (keyof FinancialFields)[];
++  manualActualCash?: number;
++  auditorId?: string;
++  auditorComment?: string;
++  auditorReviewedAt?: string; // ISO timestamp
++  createdAt: string;
++  updatedAt: string;
++}
++
++export interface DailyClosingAuditLog {
++  id: string;
++  closingId: string;
++  actorRole: UserRole;
++  actorId?: string;
++  action: AuditAction;
++  comment?: string;
++  timestamp: string; // ISO timestamp
++}
++
++export const EMPTY_FINANCIAL_FIELDS: FinancialFields = {
++  grossSales: 0,
++  netSales: 0,
++  cashSystem: 0,
++  cashActualHanded: 0,
++  spanSystem: 0,
++  deliveryAppsSystem: 0,
++  reversedTransactions: 0,
++  shortageOrExcess: 0,
++};
++
++/**
++ * Compute shortage/excess = cashActualHanded - cashSystem
++ * Positive => excess (زيادة), Negative => shortage (عجز).
++ */
++export function computeShortageOrExcess(
++  cashActualHanded: number,
++  cashSystem: number,
++): number {
++  const actual = Number.isFinite(cashActualHanded) ? cashActualHanded : 0;
++  const system = Number.isFinite(cashSystem) ? cashSystem : 0;
++  return Number((actual - system).toFixed(2));
++}
+diff --git a/app/lib/utils.ts b/app/lib/utils.ts
+new file mode 100644
+--- /dev/null
++++ b/app/lib/utils.ts
+@@ -0,0 +1,9 @@
++import { clsx, type ClassValue } from "clsx";
++import { twMerge } from "tailwind-merge";
++
++/**
++ * Merge Tailwind class names safely (later classes win on conflicts).
++ */
++export function cn(...inputs: ClassValue[]): string {
++  return twMerge(clsx(inputs));
++}
+diff --git a/app/lib/supabase.ts b/app/lib/supabase.ts
+new file mode 100644
+--- /dev/null
++++ b/app/lib/supabase.ts
+@@ -0,0 +1,27 @@
++import { createClient, SupabaseClient } from "@supabase/supabase-js";
++
++const supabaseUrl =
++  process.env.NEXT_PUBLIC_SUPABASE_URL ??
++  process.env.NEXT_PUBLIC_SUPABASE_PROJECT_URL ??
++  "";
++
++const supabaseAnonKey =
++  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ??
++  process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY ??
++  "";
++
++export const isSupabaseConfigured = Boolean(supabaseUrl && supabaseAnonKey);
++
++let _supabase: SupabaseClient | null = null;
++
++export function getSupabase(): SupabaseClient {
++  if (!_supabase) {
++    if (!isSupabaseConfigured) {
++      throw new Error(
++        "Supabase env vars missing: set NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY",
++      );
++    }
++    _supabase = createClient(supabaseUrl, supabaseAnonKey);
++  }
++  return _supabase;
++}
+diff --git a/app/cashier/page.tsx b/app/cashier/page.tsx
+new file mode 100644
+--- /dev/null
++++ b/app/cashier/page.tsx
+@@ -0,0 +1,22 @@
++import Link from "next/link";
++import { ArrowRight, Calculator } from "lucide-react";
++
++export default function CashierPage() {
++  return (
++    <main className="mx-auto max-w-3xl px-4 py-10">
++      <Link
++        href="/"
++        className="mb-6 inline-flex items-center gap-1 text-sm text-slate-600 hover:text-slate-900"
++      >
++        <ArrowRight className="h-4 w-4" />
++        العودة للرئيسية
++      </Link>
++
++      <div className="card-frame p-8 text-center">
++        <Calculator className="mx-auto h-10 w-10 text-emerald-600" />
++        <h1 className="mt-4 text-2xl font-bold">شاشة الكاشير</h1>
++        <p className="mt-2 text-slate-600">هيكل M1 — سيتوفر المعالج ثلاثي الخطوات في M2.</p>
++      </div>
++    </main>
++  );
++}
+diff --git a/app/auditor/page.tsx b/app/auditor/page.tsx
+new file mode 100644
+--- /dev/null
++++ b/app/auditor/page.tsx
+@@ -0,0 +1,22 @@
++import Link from "next/link";
++import { ArrowRight, ShieldCheck } from "lucide-react";
++
++export default function AuditorPage() {
++  return (
++    <main className="mx-auto max-w-3xl px-4 py-10">
++      <Link
++        href="/"
++        className="mb-6 inline-flex items-center gap-1 text-sm text-slate-600 hover:text-slate-900"
++      >
++        <ArrowRight className="h-4 w-4" />
++        العودة للرئيسية
++      </Link>
++
++      <div className="card-frame p-8 text-center">
++        <ShieldCheck className="mx-auto h-10 w-10 text-amber-600" />
++        <h1 className="mt-4 text-2xl font-bold">الإدارة المالية والمراجعة</h1>
++        <p className="mt-2 text-slate-600">هيكل M1 — ستبدأ التبويبات (الاعتماد / التقارير / سجل التدقيق) في M4.</p>
++      </div>
++    </main>
++  );
++}
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,37 @@
++# dependencies
++/node_modules
++/.pnp
++.pnp.js
++
++# testing
++/coverage
++
++# next.js
++/.next/
++/out/
++
++# production
++/build
++
++# misc
++.DS_Store
++*.pem
++
++# debug
++npm-debug.log*
++yarn-debug.log*
++yarn-error.log*
++
++# local env files
++.env
++.env.local
++.env*.local
++
++# secrets (GLM credentials — never commit)
++.sec
++
++# vercel
++.vercel
++
++# typescript
++*.tsbuildinfo
+END_DIFF

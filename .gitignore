@@ -2,6 +2,7 @@
 .sec
 *.sec
 !.sec.example
+DB.txt
 
 # Env
 .env
