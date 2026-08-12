@@ -180,11 +180,11 @@ Verified against the live endpoint (`briefs/probe_glm_vision.js`, `briefs/probe_
 1. **M0** — Foundation — **done** (confirmed 2026-08-11)  
 2. **M1** — Skeleton: Next + types + Supabase client + design tokens + portal shells; `npm run build` — **done** (GLM R3 approved by Claude+Codex; applied 2026-08-11)  
 3. **M2** — Cashier 3-step + Storage uploads + duplicate-date guard + branch lock — **done** (R4 applied under user waiver A+B 2026-08-12; known Majors deferred)  
-4. **M3** — **GLM** `/api/analyze-closing-image` + confirmation UI  
+4. **M3** — **GLM** `/api/analyze-closing-image` + confirmation UI — **done** (R5 applied under user waiver 2026-08-12; reviewers rate-limited)  
 5. **M4** — Auditor tabs (approvals, gated reports, audit log)  
 6. **M5** — Migrations/RLS/seed/README; Vercel env complete (`GLM_API_KEY` server-side)
 
-**Post-M2 user action:** run `supabase/migrations/002_daily_closings.sql` in Supabase SQL Editor.
+**Post-M3 user actions:** run `supabase/migrations/004_ai_extraction.sql`; set Vercel server env `GLM_API_KEY`, `GLM_BASE_URL`, `GLM_VISION_MODEL=glm-4.6v` (never `NEXT_PUBLIC_`).
 
 ---
 
