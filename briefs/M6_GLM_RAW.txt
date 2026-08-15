@@ -1,0 +1,3630 @@
+===FILE: app/lib/auth.ts===
+// M6 — demo login gateway & session helpers.
+//
+// Single source of truth: localStorage key `luxuryprep_session`.
+//
+// v1 scope (per brief): DEMO credentials only — no real user store, no
+// Supabase Auth tables. The cashier/branch tab validates against the
+// branch list loaded from Supabase (public.branches) before a session is
+// created. Supabase Auth replaces the credential checks in a later
+// milestone. Do NOT treat anything here as real security.
+
+export type SessionRole = "cashier" | "manager" | "auditor" | "admin";
+
+export interface Session {
+  role: SessionRole;
+  branchId?: string;
+  branchName?: string;
+  at: string; // ISO timestamp of login
+}
+
+/** New M6 session key (single source of truth). */
+export const SESSION_STORAGE_KEY = "luxuryprep_session";
+
+/**
+ * Legacy key the cashier page (M2–M4) reads to lock the branch.
+ * On cashier login we write BOTH keys so existing wizard behavior
+ * (branch restore + lock) keeps working untouched.
+ */
+export const CASHIER_BRANCH_STORAGE_KEY = "cashier_selected_branch";
+
+// Demo credentials v1 (NOT secrets — safe defaults, overridable via env).
+// See .env.local.example. Supabase Auth replaces these later.
+const DEMO_FINANCE_USER =
+  process.env.NEXT_PUBLIC_LOGIN_FINANCE_USER ?? "finance";
+const DEMO_FINANCE_PASSWORD =
+  process.env.NEXT_PUBLIC_LOGIN_FINANCE_PASSWORD ?? "finance";
+const DEMO_ADMIN_USER = process.env.NEXT_PUBLIC_LOGIN_ADMIN_USER ?? "admin";
+const DEMO_ADMIN_PASSWORD =
+  process.env.NEXT_PUBLIC_LOGIN_ADMIN_PASSWORD ?? "admin";
+
+const VALID_ROLES: SessionRole[] = ["cashier", "manager", "auditor", "admin"];
+
+function isSessionRole(value: unknown): value is SessionRole {
+  return (
+    typeof value === "string" &&
+    (VALID_ROLES as string[]).includes(value)
+  );
+}
+
+function parseSession(raw: string | null): Session | null {
+  if (!raw) return null;
+  try {
+    const value = JSON.parse(raw) as unknown;
+    if (typeof value !== "object" || value === null) return null;
+    const v = value as Partial<Session>;
+    if (!isSessionRole(v.role)) return null;
+    if (typeof v.at !== "string" || v.at === "") return null;
+    const session: Session = { role: v.role, at: v.at };
+    if (typeof v.branchId === "string" && v.branchId !== "") {
+      session.branchId = v.branchId;
+    }
+    if (typeof v.branchName === "string" && v.branchName !== "") {
+      session.branchName = v.branchName;
+    }
+    return session;
+  } catch {
+    return null;
+  }
+}
+
+export function getSession(): Session | null {
+  if (typeof window === "undefined") return null;
+  try {
+    return parseSession(window.localStorage.getItem(SESSION_STORAGE_KEY));
+  } catch {
+    return null;
+  }
+}
+
+export function setSession(session: Session): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(
+      SESSION_STORAGE_KEY,
+      JSON.stringify(session),
+    );
+  } catch {
+    return; // storage full / privacy mode — nothing else to do
+  }
+  // Keep the cashier branch lock (M2–M4) in sync so the existing wizard
+  // restores the branch exactly as before.
+  if (
+    (session.role === "cashier" || session.role === "manager") &&
+    session.branchId &&
+    session.branchName
+  ) {
+    try {
+      window.localStorage.setItem(
+        CASHIER_BRANCH_STORAGE_KEY,
+        JSON.stringify({ id: session.branchId, name: session.branchName }),
+      );
+    } catch {
+      // ignore
+    }
+  }
+}
+
+/**
+ * Cashier/branch login. The branch object MUST come from the validated
+ * Supabase branch list (public.branches) — the login form enforces this.
+ */
+export function startCashierSession(
+  branch: { id: string; name: string },
+  role: Extract<SessionRole, "cashier" | "manager"> = "cashier",
+): Session {
+  const session: Session = {
+    role,
+    branchId: branch.id,
+    branchName: branch.name,
+    at: new Date().toISOString(),
+  };
+  setSession(session);
+  return session;
+}
+
+export function clearSession(): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.removeItem(SESSION_STORAGE_KEY);
+    // Also drop the legacy branch lock so a shared device cannot bounce
+    // straight back into a stale cashier context.
+    window.localStorage.removeItem(CASHIER_BRANCH_STORAGE_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+/** Returns the session only when its role is one of `roles`. */
+export function requireRole(...roles: SessionRole[]): Session | null {
+  const session = getSession();
+  if (!session) return null;
+  return roles.includes(session.role) ? session : null;
+}
+
+/** Home route per role (used by the gateway "continue" action). */
+export function sessionHomeFor(role: SessionRole): string {
+  switch (role) {
+    case "auditor":
+      return "/auditor";
+    case "admin":
+      return "/admin";
+    default:
+      return "/cashier";
+  }
+}
+
+function credentialsMatch(
+  user: string,
+  password: string,
+  expectedUser: string,
+  expectedPassword: string,
+): boolean {
+  return (
+    user.trim().toLowerCase() === expectedUser.trim().toLowerCase() &&
+    password === expectedPassword
+  );
+}
+
+/** Demo v1 check for the «المراجعة المالية» tab. */
+export function checkFinanceCredentials(
+  user: string,
+  password: string,
+): boolean {
+  return credentialsMatch(
+    user,
+    password,
+    DEMO_FINANCE_USER,
+    DEMO_FINANCE_PASSWORD,
+  );
+}
+
+/** Demo v1 check for the «مسؤول IT» tab. */
+export function checkAdminCredentials(
+  user: string,
+  password: string,
+): boolean {
+  return credentialsMatch(user, password, DEMO_ADMIN_USER, DEMO_ADMIN_PASSWORD);
+}
+===ENDFILE===
+
+===FILE: app/login-form.tsx===
+"use client";
+
+// M6 — luxuryprep login gateway (demo v1).
+// Tabs: الفرع/الكاشير · المراجعة المالية · مسؤول IT.
+// No Firebase. Branches are validated against the Supabase branch list.
+
+import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { useRouter } from "next/navigation";
+import {
+  AlertCircle,
+  Calculator,
+  Eye,
+  EyeOff,
+  Loader2,
+  LogIn,
+  LogOut,
+  ShieldCheck,
+  Store,
+  UserCog,
+} from "lucide-react";
+import type { Branch } from "./types";
+import { loadBranches } from "./lib/branches";
+import {
+  checkAdminCredentials,
+  checkFinanceCredentials,
+  clearSession,
+  getSession,
+  sessionHomeFor,
+  setSession,
+  startCashierSession,
+  type Session,
+  type SessionRole,
+} from "./lib/auth";
+
+type LoginTab = "cashier" | "finance" | "it";
+
+const TABS: { id: LoginTab; label: string; icon: typeof Store }[] = [
+  { id: "cashier", label: "الفرع / الكاشير", icon: Store },
+  { id: "finance", label: "المراجعة المالية", icon: ShieldCheck },
+  { id: "it", label: "مسؤول IT", icon: UserCog },
+];
+
+const ROLE_LABEL: Record<SessionRole, string> = {
+  cashier: "كاشير الفرع",
+  manager: "مدير الفرع",
+  auditor: "المراجعة المالية",
+  admin: "مسؤول IT",
+};
+
+const INPUT_CLASS =
+  "w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/20";
+
+const SUBMIT_CLASS =
+  "inline-flex w-full items-center justify-center gap-2 rounded-lg bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-emerald-700 disabled:opacity-50";
+
+export default function LoginForm() {
+  const router = useRouter();
+  const [tab, setTab] = useState<LoginTab>("cashier");
+
+  // Branch list — loaded from Supabase (public.branches) so every branch
+  // shown (or typed) is validated against the real list.
+  const [branches, setBranches] = useState<Branch[]>([]);
+  const [branchesLoading, setBranchesLoading] = useState(true);
+  const [branchesError, setBranchesError] = useState<string | null>(null);
+  const [selectedBranchId, setSelectedBranchId] = useState("");
+  const [manualBranchId, setManualBranchId] = useState("");
+
+  // Credential forms (demo v1).
+  const [financeUser, setFinanceUser] = useState("");
+  const [financePassword, setFinancePassword] = useState("");
+  const [adminUser, setAdminUser] = useState("");
+  const [adminPassword, setAdminPassword] = useState("");
+  const [showFinancePassword, setShowFinancePassword] = useState(false);
+  const [showAdminPassword, setShowAdminPassword] = useState(false);
+
+  const [submitting, setSubmitting] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
+  const [activeSession, setActiveSession] = useState<Session | null>(null);
+
+  const reloadBranches = useCallback(() => {
+    let cancelled = false;
+    setBranchesLoading(true);
+    setBranchesError(null);
+    loadBranches()
+      .then((list) => {
+        if (cancelled) return;
+        setBranches(list);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setBranchesError("تعذّر تحميل قائمة الفروع من Supabase.");
+      })
+      .finally(() => {
+        if (cancelled) return;
+        setBranchesLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    // localStorage is client-only — read any existing session after mount.
+    setActiveSession(getSession());
+    const cancel = reloadBranches();
+    return cancel;
+  }, [reloadBranches]);
+
+  function switchTab(id: LoginTab) {
+    setTab(id);
+    setFormError(null);
+  }
+
+  function handleBranchIdChange(raw: string) {
+    setManualBranchId(raw);
+    if (formError) setFormError(null);
+    // Typing an id (B01…) is allowed — it must match a loaded branch.
+    const typed = raw.trim().toUpperCase();
+    if (typed && branches.some((b) => b.id === typed)) {
+      setSelectedBranchId(typed);
+    }
+  }
+
+  function handleCashierSubmit(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    setFormError(null);
+    const typed = manualBranchId.trim().toUpperCase();
+    const branch =
+      branches.find((b) => b.id === typed) ??
+      branches.find((b) => b.id === selectedBranchId) ??
+      null;
+    if (!branch) {
+      setFormError("اختر فرعًا من القائمة أو أدخل رقمه الصحيح (مثل B01).");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      // Writes both luxuryprep_session and cashier_selected_branch.
+      startCashierSession({ id: branch.id, name: branch.name });
+      router.replace("/cashier");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  function handleFinanceSubmit(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    setFormError(null);
+    if (!financeUser.trim() || !financePassword) {
+      setFormError("أدخل اسم المستخدم وكلمة المرور.");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      if (!checkFinanceCredentials(financeUser, financePassword)) {
+        setFormError("بيانات الدخول غير صحيحة.");
+        return;
+      }
+      setSession({ role: "auditor", at: new Date().toISOString() });
+      router.replace("/auditor");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  function handleAdminSubmit(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    setFormError(null);
+    if (!adminUser.trim() || !adminPassword) {
+      setFormError("أدخل اسم المستخدم وكلمة المرور.");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      if (!checkAdminCredentials(adminUser, adminPassword)) {
+        setFormError("بيانات الدخول غير صحيحة.");
+        return;
+      }
+      setSession({ role: "admin", at: new Date().toISOString() });
+      router.replace("/admin");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  function handleContinueSession() {
+    if (!activeSession) return;
+    router.replace(sessionHomeFor(activeSession.role));
+  }
+
+  function handleLogoutSession() {
+    clearSession();
+    setActiveSession(null);
+  }
+
+  return (
+    <main
+      className="flex min-h-screen items-center justify-center bg-gradient-to-b from-slate-100 via-white to-emerald-50 px-4 py-10"
+      dir="rtl"
+    >
+      <div className="w-full max-w-md">
+        <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-xl shadow-slate-200/60 sm:p-8">
+          {/* Brand */}
+          <div className="mb-6 text-center">
+            <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-emerald-600 text-white shadow-lg shadow-emerald-600/30">
+              <Calculator className="h-7 w-7" />
+            </div>
+            <h1 className="mt-4 text-xl font-bold text-slate-900">
+              بوابة الإغلاق المالي والمراجعة
+            </h1>
+            <p className="mt-1 text-sm text-slate-500">
+              <span className="font-semibold tracking-wide text-emerald-700">
+                luxuryprep
+              </span>{" "}
+              — تسجيل الدخول
+            </p>
+          </div>
+
+          {/* Tabs */}
+          <div
+            className="mb-6 grid grid-cols-3 gap-1 rounded-xl bg-slate-100 p-1"
+            role="tablist"
+          >
+            {TABS.map((t) => {
+              const Icon = t.icon;
+              const isActive = tab === t.id;
+              return (
+                <button
+                  key={t.id}
+                  type="button"
+                  role="tab"
+                  aria-selected={isActive}
+                  onClick={() => switchTab(t.id)}
+                  className={`flex flex-col items-center justify-center gap-1 rounded-lg px-1 py-2 text-[11px] font-medium transition sm:flex-row sm:gap-2 sm:text-sm ${
+                    isActive
+                      ? "bg-white text-emerald-700 shadow-sm"
+                      : "text-slate-500 hover:text-slate-700"
+                  }`}
+                >
+                  <Icon className="h-4 w-4" />
+                  <span>{t.label}</span>
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Existing session */}
+          {activeSession && (
+            <div className="mb-4 rounded-lg border border-emerald-200 bg-emerald-50 p-3">
+              <div className="flex items-start gap-2">
+                <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />
+                <p className="text-sm text-emerald-800">
+                  جلسة نشطة:{" "}
+                  <span className="font-semibold">
+                    {ROLE_LABEL[activeSession.role]}
+                  </span>
+                  {activeSession.branchName
+                    ? ` — ${activeSession.branchName}`
+                    : ""}
+                </p>
+              </div>
+              <div className="mt-2 flex gap-2">
+                <button
+                  type="button"
+                  onClick={handleContinueSession}
+                  className="rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-emerald-700"
+                >
+                  متابعة
+                </button>
+                <button
+                  type="button"
+                  onClick={handleLogoutSession}
+                  className="inline-flex items-center gap-1 rounded-md border border-emerald-300 bg-white px-3 py-1.5 text-xs font-medium text-emerald-700 transition hover:bg-emerald-100"
+                >
+                  <LogOut className="h-3.5 w-3.5" />
+                  تسجيل الخروج
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Error */}
+          {formError && (
+            <div className="mb-4 flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">
+              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+              <span>{formError}</span>
+            </div>
+          )}
+
+          {/* Tab: cashier / branch */}
+          {tab === "cashier" && (
+            <form onSubmit={handleCashierSubmit} className="space-y-4">
+              <div>
+                <label
+                  htmlFor="login-branch"
+                  className="mb-1 block text-sm font-medium text-slate-700"
+                >
+                  الفرع
+                </label>
+                {branchesLoading ? (
+                  <div className="flex items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm text-slate-500">
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    جارٍ تحميل الفروع…
+                  </div>
+                ) : branchesError ? (
+                  <div className="space-y-2">
+                    <div className="flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2.5 text-sm text-rose-700">
+                      <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+                      <span>{branchesError}</span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={reloadBranches}
+                      className="text-sm font-medium text-emerald-700 hover:underline"
+                    >
+                      إعادة المحاولة
+                    </button>
+                  </div>
+                ) : (
+                  <select
+                    id="login-branch"
+                    value={selectedBranchId}
+                    onChange={(e) => {
+                      setSelectedBranchId(e.target.value);
+                      if (formError) setFormError(null);
+                    }}
+                    className={INPUT_CLASS}
+                  >
+                    <option value="">— اختر الفرع —</option>
+                    {branches.map((b) => (
+                      <option key={b.id} value={b.id}>
+                        {b.id} — {b.name}
+                      </option>
+                    ))}
+                  </select>
+                )}
+              </div>
+              {!branchesLoading && !branchesError && (
+                <div>
+                  <label
+                    htmlFor="login-branch-id"
+                    className="mb-1 block text-sm font-medium text-slate-700"
+                  >
+                    أو أدخل رقم الفرع
+                  </label>
+                  <input
+                    id="login-branch-id"
+                    type="text"
+                    dir="ltr"
+                    placeholder="B01"
+                    value={manualBranchId}
+                    onChange={(e) => handleBranchIdChange(e.target.value)}
+                    className={`${INPUT_CLASS} font-mono uppercase`}
+                  />
+                  <p className="mt-1 text-xs text-slate-400">
+                    يجب أن يطابق فرعًا من القائمة (B01…) — يُتحقق من الرقم
+                    مقابل قائمة الفروع.
+                  </p>
+                </div>
+              )}
+              <button
+                type="submit"
+                disabled={submitting || branchesLoading || branchesError !== null}
+                className={SUBMIT_CLASS}
+              >
+                {submitting ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    جارٍ الدخول…
+                  </>
+                ) : (
+                  <>
+                    <LogIn className="h-4 w-4" />
+                    دخول الكاشير
+                  </>
+                )}
+              </button>
+            </form>
+          )}
+
+          {/* Tab: finance / auditor */}
+          {tab === "finance" && (
+            <form onSubmit={handleFinanceSubmit} className="space-y-4">
+              <div>
+                <label
+                  htmlFor="finance-user"
+                  className="mb-1 block text-sm font-medium text-slate-700"
+                >
+                  اسم المستخدم
+                </label>
+                <input
+                  id="finance-user"
+                  type="text"
+                  dir="ltr"
+                  autoComplete="username"
+                  value={financeUser}
+                  onChange={(e) => {
+                    setFinanceUser(e.target.value);
+                    if (formError) setFormError(null);
+                  }}
+                  className={INPUT_CLASS}
+                />
+              </div>
+              <div>
+                <label
+                  htmlFor="finance-password"
+                  className="mb-1 block text-sm font-medium text-slate-700"
+                >
+                  كلمة المرور
+                </label>
+                <div className="relative">
+                  <input
+                    id="finance-password"
+                    type={showFinancePassword ? "text" : "password"}
+                    dir="ltr"
+                    autoComplete="current-password"
+                    value={financePassword}
+                    onChange={(e) => {
+                      setFinancePassword(e.target.value);
+                      if (formError) setFormError(null);
+                    }}
+                    className={`${INPUT_CLASS} pl-10`}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowFinancePassword((v) => !v)}
+                    aria-label={
+                      showFinancePassword
+                        ? "إخفاء كلمة المرور"
+                        : "إظهار كلمة المرور"
+                    }
+                    className="absolute inset-y-0 left-2 flex items-center text-slate-400 transition hover:text-slate-600"
+                  >
+                    {showFinancePassword ? (
+                      <EyeOff className="h-4 w-4" />
+                    ) : (
+                      <Eye className="h-4 w-4" />
+                    )}
+                  </button>
+                </div>
+              </div>
+              <button type="submit" disabled={submitting} className={SUBMIT_CLASS}>
+                {submitting ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    جارٍ الدخول…
+                  </>
+                ) : (
+                  <>
+                    <LogIn className="h-4 w-4" />
+                    دخول المراجعة المالية
+                  </>
+                )}
+              </button>
+            </form>
+          )}
+
+          {/* Tab: IT / admin */}
+          {tab === "it" && (
+            <form onSubmit={handleAdminSubmit} className="space-y-4">
+              <div>
+                <label
+                  htmlFor="admin-user"
+                  className="mb-1 block text-sm font-medium text-slate-700"
+                >
+                  اسم المستخدم
+                </label>
+                <input
+                  id="admin-user"
+                  type="text"
+                  dir="ltr"
+                  autoComplete="username"
+                  value={adminUser}
+                  onChange={(e) => {
+                    setAdminUser(e.target.value);
+                    if (formError) setFormError(null);
+                  }}
+                  className={INPUT_CLASS}
+                />
+              </div>
+              <div>
+                <label
+                  htmlFor="admin-password"
+                  className="mb-1 block text-sm font-medium text-slate-700"
+                >
+                  كلمة المرور
+                </label>
+                <div className="relative">
+                  <input
+                    id="admin-password"
+                    type={showAdminPassword ? "text" : "password"}
+                    dir="ltr"
+                    autoComplete="current-password"
+                    value={adminPassword}
+                    onChange={(e) => {
+                      setAdminPassword(e.target.value);
+                      if (formError) setFormError(null);
+                    }}
+                    className={`${INPUT_CLASS} pl-10`}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowAdminPassword((v) => !v)}
+                    aria-label={
+                      showAdminPassword
+                        ? "إخفاء كلمة المرور"
+                        : "إظهار كلمة المرور"
+                    }
+                    className="absolute inset-y-0 left-2 flex items-center text-slate-400 transition hover:text-slate-600"
+                  >
+                    {showAdminPassword ? (
+                      <EyeOff className="h-4 w-4" />
+                    ) : (
+                      <Eye className="h-4 w-4" />
+                    )}
+                  </button>
+                </div>
+              </div>
+              <button type="submit" disabled={submitting} className={SUBMIT_CLASS}>
+                {submitting ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    جارٍ الدخول…
+                  </>
+                ) : (
+                  <>
+                    <LogIn className="h-4 w-4" />
+                    دخول مسؤول IT
+                  </>
+                )}
+              </button>
+            </form>
+          )}
+        </div>
+
+        <p className="mt-4 text-center text-xs text-slate-400">
+          وضع تجريبي — المراجعة المالية: finance / finance · مسؤول IT: admin /
+          admin
+        </p>
+      </div>
+    </main>
+  );
+}
+===ENDFILE===
+
+===FILE: app/page.tsx===
+import LoginForm from "./login-form";
+
+export default function HomePage() {
+  return <LoginForm />;
+}
+===ENDFILE===
+
+===FILE: app/admin/page.tsx===
+"use client";
+
+// M6 — IT admin shell (luxuryprep). Ready for future features.
+// NOTE: no Firebase anything here — and no fake connection settings.
+
+import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
+import {
+  Clock,
+  Info,
+  Loader2,
+  LogOut,
+  Server,
+  ShieldCheck,
+} from "lucide-react";
+import { clearSession, requireRole, type Session } from "../lib/auth";
+import { isSupabaseConfigured } from "../lib/supabase";
+
+function formatLoginTime(iso: string): string {
+  try {
+    return new Date(iso).toLocaleString("ar-SA-u-ca-gregory", {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch {
+    return iso;
+  }
+}
+
+export default function AdminPage() {
+  const router = useRouter();
+  const [session, setSession] = useState<Session | null>(null);
+  const [authChecked, setAuthChecked] = useState(false);
+
+  // M6: gateway guard — admin session required.
+  useEffect(() => {
+    const s = requireRole("admin");
+    if (!s) {
+      router.replace("/");
+      return;
+    }
+    setSession(s);
+    setAuthChecked(true);
+  }, [router]);
+
+  function handleLogout() {
+    clearSession();
+    router.replace("/");
+  }
+
+  if (!authChecked) {
+    return (
+      <main
+        className="flex min-h-screen items-center justify-center bg-slate-50"
+        dir="rtl"
+      >
+        <div className="flex items-center gap-2 text-slate-500">
+          <Loader2 className="h-5 w-5 animate-spin" />
+          <span className="text-sm">جارٍ التحقق من الجلسة…</span>
+        </div>
+      </main>
+    );
+  }
+
+  return (
+    <main className="min-h-screen bg-slate-50" dir="rtl">
+      <header className="border-b border-slate-200 bg-white">
+        <div className="mx-auto max-w-4xl px-4 py-5">
+          <div className="flex items-center justify-between">
+            <button
+              type="button"
+              onClick={handleLogout}
+              className="inline-flex items-center gap-1 text-sm text-slate-600 hover:text-rose-600"
+            >
+              <LogOut className="h-4 w-4" />
+              تسجيل الخروج
+            </button>
+            <div className="flex items-center gap-2 text-emerald-700">
+              <ShieldCheck className="h-5 w-5" />
+              <span className="text-sm font-medium">luxuryprep · مسؤول IT</span>
+            </div>
+          </div>
+          <h1 className="mt-3 text-xl font-bold text-slate-900">
+            لوحة مسؤول IT
+          </h1>
+          <p className="mt-1 text-sm text-slate-600">
+            بوابة الإغلاق المالي والمراجعة — إدارة النظام والتهيئة.
+          </p>
+        </div>
+      </header>
+
+      <div className="mx-auto max-w-4xl space-y-4 px-4 py-6">
+        <div className="rounded-lg border border-slate-200 bg-white p-8 text-center">
+          <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-emerald-100 text-emerald-700">
+            <ShieldCheck className="h-7 w-7" />
+          </div>
+          <h2 className="mt-4 text-lg font-bold text-slate-900">
+            لوحة مسؤول IT — جاهزة للميزات القادمة
+          </h2>
+          <p className="mx-auto mt-2 max-w-md text-sm leading-6 text-slate-600">
+            هذه اللوحة هيكل جاهز. أدوات إدارة المستخدمين والفروع والصلاحيات
+            ستُضاف في الميزات القادمة — لا توجد إعدادات مفعّلة في هذا الإصدار.
+          </p>
+        </div>
+
+        <div className="grid gap-3 sm:grid-cols-2">
+          <div className="rounded-lg border border-slate-200 bg-white p-4">
+            <div className="flex items-center gap-2 text-slate-700">
+              <Clock className="h-4 w-4" />
+              <span className="text-sm font-semibold">الجلسة الحالية</span>
+            </div>
+            <dl className="mt-3 space-y-1.5 text-sm">
+              <div className="flex items-center justify-between">
+                <dt className="text-slate-500">الدور</dt>
+                <dd className="font-medium text-slate-900">مسؤول IT</dd>
+              </div>
+              <div className="flex items-center justify-between">
+                <dt className="text-slate-500">تسجيل الدخول</dt>
+                <dd className="font-medium text-slate-900">
+                  {session ? formatLoginTime(session.at) : "—"}
+                </dd>
+              </div>
+            </dl>
+          </div>
+
+          <div className="rounded-lg border border-slate-200 bg-white p-4">
+            <div className="flex items-center gap-2 text-slate-700">
+              <Server className="h-4 w-4" />
+              <span className="text-sm font-semibold">حالة Supabase</span>
+            </div>
+            <div className="mt-3 flex items-center justify-between text-sm">
+              <span className="text-slate-500">متغيرات البيئة</span>
+              {isSupabaseConfigured ? (
+                <span className="rounded-full bg-emerald-100 px-2.5 py-0.5 text-xs font-medium text-emerald-800">
+                  مُهيّأة
+                </span>
+              ) : (
+                <span className="rounded-full bg-amber-100 px-2.5 py-0.5 text-xs font-medium text-amber-800">
+                  غير مُهيّأة
+                </span>
+              )}
+            </div>
+            <p className="mt-2 flex items-start gap-1 text-xs text-slate-400">
+              <Info className="mt-0.5 h-3 w-3 shrink-0" />
+              قراءة فقط لوجود متغيرات NEXT_PUBLIC_SUPABASE_* — لا يُفتح أي اتصال
+              من هذه اللوحة.
+            </p>
+          </div>
+        </div>
+      </div>
+    </main>
+  );
+}
+===ENDFILE===
+
+===FILE: app/cashier/page.tsx===
+"use client";
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import {
+  AlertCircle,
+  Calculator,
+  Check,
+  Loader2,
+  Lock,
+  LogOut,
+  RotateCcw,
+  Sparkles,
+} from "lucide-react";
+import {
+  Branch,
+  FinancialFields,
+  EMPTY_FINANCIAL_FIELDS,
+  computeShortageOrExcess,
+} from "../types";
+import { loadBranches } from "../lib/branches";
+import {
+  checkDuplicateClosing,
+  saveClosing,
+  ClosingResult,
+} from "../lib/closings";
+import { clearSession, getSession, type Session } from "../lib/auth";
+
+type Step = 1 | 2 | 3;
+
+const BRANCH_SESSION_KEY = "cashier_selected_branch";
+
+interface SavedBranch {
+  id: string;
+  name: string;
+}
+
+type MonetaryKey =
+  | "grossSales"
+  | "netSales"
+  | "cashSystem"
+  | "cashActualHanded"
+  | "spanSystem"
+  | "deliveryAppsSystem"
+  | "reversedTransactions";
+
+const AI_EXTRACTABLE_FIELDS: MonetaryKey[] = [
+  "grossSales",
+  "netSales",
+  "cashSystem",
+  "cashActualHanded",
+  "spanSystem",
+  "deliveryAppsSystem",
+  "reversedTransactions",
+];
+
+const EMPTY_RAW_VALUES: Record<MonetaryKey, string> = {
+  grossSales: "",
+  netSales: "",
+  cashSystem: "",
+  cashActualHanded: "",
+  spanSystem: "",
+  deliveryAppsSystem: "",
+  reversedTransactions: "",
+};
+
+// Align with migration 003 allowed_mime_types — gif is rejected by the bucket.
+const ACCEPTED_IMAGE_TYPES = "image/jpeg,image/png,image/webp,image/heic";
+
+type FieldBadge = "ai" | "manual" | null;
+
+/**
+ * B1: parse localized monetary input safely.
+ *
+ * Normalizes Arabic-Indic digits, maps Arabic separators, then decides which
+ * single character is the decimal point — stripping all other separators and
+ * converting ONLY that one character. Never re-normalizes after conversion.
+ *
+ * Verified test cases:
+ *   "1234"      -> 1234
+ *   "1234.50"   -> 1234.5
+ *   "1,234.50"  -> 1234.5
+ *   "1.234,50"  -> 1234.5
+ *   "1,234"     -> 1234
+ *   "12,5"      -> 12.5
+ *   "١٢٣٫٥٠"     -> 123.5
+ *   "١٬٢٣٤٫٥٠"   -> 1234.5
+ *   "-25.00"    -> -25
+ *   "0"         -> 0
+ */
+function parseLocalizedNumber(raw: string): number | null {
+  if (typeof raw !== "string") return null;
+
+  // Step 1: Map Arabic-Indic (٠-٩) and Eastern Arabic (۰-۹) digits to ASCII.
+  let s = raw
+    .replace(/[\u0660-\u0669]/g, (d) => String(d.charCodeAt(0) - 0x0660))
+    .replace(/[\u06f0-\u06f9]/g, (d) => String(d.charCodeAt(0) - 0x06f0));
+
+  // Step 2: Map Arabic separators to ASCII equivalents.
+  //   U+066B (٫) = Arabic decimal separator -> "."
+  //   U+066C (٬) = Arabic thousands separator -> strip
+  //   U+060C (،) = Arabic comma -> ","
+  s = s
+    .replace(/[\u066b]/g, ".")
+    .replace(/[\u066c]/g, "")
+    .replace(/[\u060c]/g, ",");
+
+  // Step 3: Strip whitespace used as thousands separators.
+  s = s.replace(/[\s\u2009\u202f]/g, "");
+
+  s = s.trim();
+  if (s === "" || s === "-" || s === ".") return null;
+
+  // Step 4: Decide which character is the decimal separator, then build
+  // the integer and fractional parts independently. This ensures exactly
+  // ONE normalization pass — no re-normalization of already-converted
+  // values.
+  const lastDot = s.lastIndexOf(".");
+  const lastComma = s.lastIndexOf(",");
+
+  let intPart = "";
+  let fracPart = "";
+
+  if (lastDot >= 0 && lastComma >= 0) {
+    // Both present: the rightmost separator is the decimal point.
+    if (lastDot > lastComma) {
+      // Dot is decimal — commas are thousands.
+      intPart = s.slice(0, lastDot).replace(/,/g, "");
+      fracPart = s.slice(lastDot + 1);
+    } else {
+      // Comma is decimal — dots are thousands.
+      intPart = s.slice(0, lastComma).replace(/\./g, "");
+      fracPart = s.slice(lastComma + 1);
+    }
+  } else if (lastDot >= 0) {
+    // Only dots. Multiple dots → all are thousands separators.
+    const dotCount = (s.match(/\./g) ?? []).length;
+    if (dotCount > 1) {
+      intPart = s.replace(/\./g, "");
+    } else {
+      intPart = s.slice(0, lastDot);
+      fracPart = s.slice(lastDot + 1);
+    }
+  } else if (lastComma >= 0) {
+    // Only commas. Multiple → all are thousands separators.
+    const commaCount = (s.match(/,/g) ?? []).length;
+    if (commaCount > 1) {
+      intPart = s.replace(/,/g, "");
+    } else {
+      // Single comma. Heuristic: if followed by exactly 3 digits at end
+      // and preceded by 1–3 digits, treat as thousands (e.g. "1,234").
+      // Otherwise treat as decimal (e.g. "12,5" → 12.5).
+      const tail = s.slice(lastComma + 1);
+      const headDigits = s.slice(0, lastComma).replace(/[^\d]/g, "");
+      if (
+        tail.length === 3 &&
+        /^\d+$/.test(tail) &&
+        /^\d{1,3}$/.test(headDigits)
+      ) {
+        intPart = s.replace(/,/g, "");
+      } else {
+        intPart = s.slice(0, lastComma);
+        fracPart = tail;
+      }
+    }
+  } else {
+    // No separators at all.
+    intPart = s;
+  }
+
+  // Keep only digits and a leading minus in the integer part.
+  intPart = intPart.replace(/[^\d-]/g, "");
+  fracPart = fracPart.replace(/\D/g, "");
+
+  // Collapse multiple minus signs to a single leading one.
+  if (intPart.startsWith("-")) {
+    intPart = "-" + intPart.replace(/-/g, "");
+  } else {
+    intPart = intPart.replace(/-/g, "");
+  }
+
+  let numeric: string;
+  if (fracPart !== "") {
+    numeric = intPart + "." + fracPart;
+  } else {
+    numeric = intPart;
+  }
+
+  if (numeric === "" || numeric === "-" || numeric === ".") return null;
+
+  const n = Number(numeric);
+  return Number.isFinite(n) ? n : null;
+}
+
+function coerceMonetary(n: number | null): number {
+  if (n === null || !Number.isFinite(n)) return 0;
+  const rounded = Math.round((n + Number.EPSILON) * 100) / 100;
+  if (!Number.isFinite(rounded)) return 0;
+  if (Math.abs(rounded) > 1e12) return 0;
+  return rounded;
+}
+
+function todayInRiyadh(): string {
+  // M7: Saudi Arabia is UTC+3. Compute the business date in Asia/Riyadh
+  // explicitly so a late-night close (00:00–03:00 local) is not attributed
+  // to the previous UTC day.
+  try {
+    const fmt = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Riyadh",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    });
+    return fmt.format(new Date());
+  } catch {
+    const d = new Date(Date.now() + 3 * 60 * 60 * 1000);
+    return d.toISOString().slice(0, 10);
+  }
+}
+
+export default function CashierPage() {
+  const [step, setStep] = useState<Step>(1);
+  const [branches, setBranches] = useState<Branch[]>([]);
+  const [branchesLoading, setBranchesLoading] = useState(true);
+  const [branchesError, setBranchesError] = useState<string | null>(null);
+  const [selectedBranch, setSelectedBranch] = useState<Branch | null>(null);
+  const [isBranchLocked, setIsBranchLocked] = useState(false);
+  const [businessDate, setBusinessDate] = useState<string>(todayInRiyadh());
+  const [fields, setFields] = useState<FinancialFields>({
+    ...EMPTY_FINANCIAL_FIELDS,
+  });
+  // B2: raw string buffer per monetary field. The displayed value comes
+  // from this buffer — never reformatted while the field has focus.
+  const [rawValues, setRawValues] = useState<Record<MonetaryKey, string>>(
+    () => ({ ...EMPTY_RAW_VALUES }),
+  );
+  // O1: cashActualHanded now uses the same rawValues buffer as every other
+  // monetary field. useManualCash controls only the label/affordance and
+  // whether manual_actual_cash is persisted — not which buffer is read.
+  const [useManualCash, setUseManualCash] = useState(false);
+  const [parseErrors, setParseErrors] = useState<Set<MonetaryKey>>(
+    new Set(),
+  );
+  const [zReportImage, setZReportImage] = useState<string | null>(null);
+  const [proofImages, setProofImages] = useState<string[]>([]);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [warnings, setWarnings] = useState<string[]>([]);
+  const [closingId, setClosingId] = useState<string | null>(null);
+  const [saveSource, setSaveSource] = useState<
+    ClosingResult["source"] | null
+  >(null);
+  const pendingBranchRestore = useRef<SavedBranch | null>(null);
+
+  // ------------------------------------------------------------------
+  // M6: login gateway guard. A cashier/manager session with a locked
+  // branch (written by the gateway together with cashier_selected_branch)
+  // is required — otherwise bounce back to the login gateway.
+  // ------------------------------------------------------------------
+  const router = useRouter();
+  const [authSession, setAuthSession] = useState<Session | null>(null);
+  const [authChecked, setAuthChecked] = useState(false);
+
+  useEffect(() => {
+    const session = getSession();
+    const allowed =
+      session !== null &&
+      (session.role === "cashier" || session.role === "manager") &&
+      typeof session.branchId === "string" &&
+      session.branchId !== "";
+    if (!allowed) {
+      router.replace("/");
+      return;
+    }
+    setAuthSession(session);
+    setAuthChecked(true);
+  }, [router]);
+
+  const handleLogout = useCallback(() => {
+    clearSession();
+    router.replace("/");
+  }, [router]);
+
+  // M3: AI extraction state
+  const [aiExtractedData, setAiExtractedData] = useState<
+    Partial<FinancialFields>
+  >({});
+  const [manuallyModifiedFields, setManuallyModifiedFields] = useState<
+    (keyof FinancialFields)[]
+  >([]);
+  const [aiAnalyzing, setAiAnalyzing] = useState(false);
+  const [aiError, setAiError] = useState<string | null>(null);
+  const [aiNotice, setAiNotice] = useState<string | null>(null);
+
+  // B4: refs to read latest AI state inside clearExtractionState without
+  // stale closures. These MUST be defined before any effect that calls
+  // clearExtractionState so they fire first in a given render cycle.
+  const aiExtractedDataRef = useRef<Partial<FinancialFields>>({});
+  const manuallyModifiedFieldsRef = useRef<(keyof FinancialFields)[]>([]);
+
+  // M6: request versioning + abort for stale AI responses.
+  const aiRequestIdRef = useRef(0);
+  const aiAbortRef = useRef<AbortController | null>(null);
+
+  // Sync refs whenever the state changes.
+  useEffect(() => {
+    aiExtractedDataRef.current = aiExtractedData;
+  }, [aiExtractedData]);
+
+  useEffect(() => {
+    manuallyModifiedFieldsRef.current = manuallyModifiedFields;
+  }, [manuallyModifiedFields]);
+
+  // M3 minor: abort in-flight analyze request and invalidate the request
+  // version on unmount so a late response never writes to unmounted state.
+  useEffect(() => {
+    return () => {
+      if (aiAbortRef.current) {
+        aiAbortRef.current.abort();
+        aiAbortRef.current = null;
+      }
+      aiRequestIdRef.current += 1;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    setBranchesLoading(true);
+    loadBranches()
+      .then((result) => {
+        if (!cancelled) {
+          setBranches(result);
+          setBranchesError(null);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setBranchesError("تعذّر تحميل قائمة الفروع");
+      })
+      .finally(() => {
+        if (!cancelled) setBranchesLoading(false);
+      });
+
+    try {
+      const saved =
+        typeof window !== "undefined"
+          ? window.localStorage.getItem(BRANCH_SESSION_KEY)
+          : null;
+      if (saved) {
+        pendingBranchRestore.current = JSON.parse(saved) as SavedBranch;
+      }
+    } catch {
+      // ignore parse errors
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (
+      branches.length > 0 &&
+      !selectedBranch &&
+      pendingBranchRestore.current
+    ) {
+      const match = branches.find(
+        (b) => b.id === pendingBranchRestore.current!.id,
+      );
+      if (match) {
+        setSelectedBranch(match);
+        setIsBranchLocked(true);
+      }
+      pendingBranchRestore.current = null;
+    }
+  }, [branches, selectedBranch]);
+
+  // O1: single buffer — effectiveActualCash derives from fields.cashActualHanded,
+  // which is kept in sync with rawValues.cashActualHanded by handleFieldChange.
+  const effectiveActualCash = fields.cashActualHanded;
+
+  useEffect(() => {
+    setFields((prev) => ({
+      ...prev,
+      shortageOrExcess: computeShortageOrExcess(
+        effectiveActualCash,
+        prev.cashSystem,
+      ),
+    }));
+  }, [effectiveActualCash, fields.cashSystem]);
+
+  // B4: clear stale extraction state AND reset AI-origin field values
+  // whenever the extraction identity changes (image, branch, date, closing).
+  // Preserve any field the cashier manually modified; clear the rest.
+  const clearExtractionState = useCallback(() => {
+    if (aiAbortRef.current) {
+      aiAbortRef.current.abort();
+      aiAbortRef.current = null;
+    }
+    aiRequestIdRef.current += 1;
+
+    const aiData = aiExtractedDataRef.current;
+    const modified = manuallyModifiedFieldsRef.current;
+    const aiKeys = Object.keys(aiData) as MonetaryKey[];
+
+    if (aiKeys.length > 0) {
+      setFields((prevFields) => {
+        const next = { ...prevFields };
+        for (const key of aiKeys) {
+          if (!modified.includes(key)) {
+            next[key] = 0;
+          }
+        }
+        // O1: shortageOrExcess is owned by the effect above; do not
+        // duplicate the assignment here.
+        return next;
+      });
+      setRawValues((prevRaw) => {
+        const next = { ...prevRaw };
+        for (const key of aiKeys) {
+          if (!modified.includes(key)) {
+            next[key] = "";
+          }
+        }
+        return next;
+      });
+      // Minor: clear stale parse errors for keys being reset so a field
+      // does not keep a stale red border after AI state is cleared.
+      setParseErrors((prev) => {
+        if (prev.size === 0) return prev;
+        const next = new Set(prev);
+        for (const key of aiKeys) {
+          if (!modified.includes(key)) {
+            next.delete(key);
+          }
+        }
+        return next;
+      });
+    }
+
+    setAiExtractedData({});
+    setManuallyModifiedFields([]);
+    setAiAnalyzing(false);
+    setAiError(null);
+    setAiNotice(null);
+  }, []);
+
+  useEffect(() => {
+    clearExtractionState();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedBranch?.id]);
+
+  useEffect(() => {
+    clearExtractionState();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [businessDate]);
+
+  const handlePickBranch = (branch: Branch) => {
+    setSelectedBranch(branch);
+    setIsBranchLocked(true);
+    try {
+      window.localStorage.setItem(
+        BRANCH_SESSION_KEY,
+        JSON.stringify({
+          id: branch.id,
+          name: branch.name,
+        } satisfies SavedBranch),
+      );
+    } catch {
+      // ignore quota / privacy errors
+    }
+  };
+
+  const resetInputs = () => {
+    setFields({ ...EMPTY_FINANCIAL_FIELDS });
+    setRawValues({ ...EMPTY_RAW_VALUES });
+    setUseManualCash(false);
+    setParseErrors(new Set());
+    setZReportImage(null);
+    setProofImages([]);
+    setSaveError(null);
+    setWarnings([]);
+    setClosingId(null);
+    setSaveSource(null);
+    clearExtractionState();
+  };
+
+  const handleConfirmBranchChange = () => {
+    if (window.confirm("تغيير الفرع؟ سيتم فقدان البيانات المدخلة.")) {
+      setSelectedBranch(null);
+      setIsBranchLocked(false);
+      setStep(1);
+      resetInputs();
+      try {
+        window.localStorage.removeItem(BRANCH_SESSION_KEY);
+      } catch {
+        // ignore
+      }
+    }
+  };
+
+  const handleStartNewClosing = () => {
+    setStep(1);
+    resetInputs();
+  };
+
+  // B2: update the raw string buffer and the parsed numeric state together.
+  // The cashier sees exactly what they type; parsing happens on every
+  // keystroke for live computation but the display is never reformatted.
+  const handleFieldChange = (key: MonetaryKey, raw: string) => {
+    if (
+      Object.keys(aiExtractedData).length > 0 &&
+      !manuallyModifiedFields.includes(key)
+    ) {
+      setManuallyModifiedFields((prev) => [...prev, key]);
+    }
+    setRawValues((prev) => ({ ...prev, [key]: raw }));
+    const parsed = parseLocalizedNumber(raw);
+    setFields((prev) => ({
+      ...prev,
+      [key]: parsed !== null ? coerceMonetary(parsed) : 0,
+    }));
+    // Minor: treat a lone "-" or "." as incomplete (no error), not invalid,
+    // so the hint does not flash mid-typing.
+    const trimmed = raw.trim();
+    const isPartialInput = trimmed === "-" || trimmed === ".";
+    setParseErrors((prev) => {
+      const hasError =
+        trimmed !== "" && parsed === null && !isPartialInput;
+      if (hasError && !prev.has(key)) {
+        const next = new Set(prev);
+        next.add(key);
+        return next;
+      }
+      if (!hasError && prev.has(key)) {
+        const next = new Set(prev);
+        next.delete(key);
+        return next;
+      }
+      return prev;
+    });
+  };
+
+  const onZReport = (file?: File) => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      clearExtractionState();
+      setZReportImage(reader.result as string);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const onProofs = (files: FileList | null) => {
+    if (!files) return;
+    Array.from(files).forEach((file) => {
+      const reader = new FileReader();
+      reader.onload = () =>
+        setProofImages((prev) => [...prev, reader.result as string]);
+      reader.readAsDataURL(file);
+    });
+  };
+
+  const handleAnalyzeImage = useCallback(async () => {
+    if (!zReportImage) return;
+
+    if (aiAbortRef.current) {
+      aiAbortRef.current.abort();
+    }
+    const controller = new AbortController();
+    aiAbortRef.current = controller;
+    const requestId = ++aiRequestIdRef.current;
+
+    setAiAnalyzing(true);
+    setAiError(null);
+    setAiNotice(null);
+    try {
+      const res = await fetch("/api/analyze-closing-image", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ imageBase64: zReportImage }),
+        signal: controller.signal,
+      });
+      const data = (await res.json().catch(() => null)) as {
+        error?: string;
+        fields?: Partial<FinancialFields>;
+        finishReason?: string | null;
+        model?: string;
+      } | null;
+
+      if (requestId !== aiRequestIdRef.current) return;
+
+      if (!res.ok || !data) {
+        const msg =
+          data?.error ?? "تعذّر تحليل الصورة. يُرجى إدخال البيانات يدويًا.";
+        setAiError(msg);
+        return;
+      }
+
+      const extracted: Partial<FinancialFields> = data.fields ?? {};
+
+      // O2: Reconcile against prior extraction. Clear any key that was
+      // AI-origin in the previous extraction but is absent from the new
+      // one — unless the cashier manually modified it. This prevents
+      // stale AI values from persisting with no badge and no way for
+      // later clearing logic to identify them as AI-origin.
+      const priorAiKeys = Object.keys(
+        aiExtractedDataRef.current,
+      ) as MonetaryKey[];
+      const modified = [...manuallyModifiedFieldsRef.current];
+      const staleKeys = priorAiKeys.filter(
+        (k) => !(k in extracted) && !modified.includes(k),
+      );
+
+      setAiExtractedData(extracted);
+      // Minor: retain manually-modified keys that are preserved under O2
+      // (modified but absent from new extraction). Keys present in the new
+      // extraction are freshly AI-set and should show the "ai" badge.
+      const preservedModified = modified.filter(
+        (k) => !(k in extracted),
+      );
+      setManuallyModifiedFields(preservedModified);
+      setFields((prev) => {
+        const next: FinancialFields = { ...prev };
+        // O2: clear stale AI keys absent from new extraction.
+        for (const key of staleKeys) {
+          next[key] = 0;
+        }
+        // Apply new extraction values (overwrites stale clears where
+        // the key is present in both).
+        for (const key of AI_EXTRACTABLE_FIELDS) {
+          const v = extracted[key];
+          if (typeof v === "number" && Number.isFinite(v)) {
+            next[key] = coerceMonetary(v);
+          }
+        }
+        next.shortageOrExcess = computeShortageOrExcess(
+          next.cashActualHanded,
+          next.cashSystem,
+        );
+        return next;
+      });
+      // B2: also update raw string buffers so displayed values match.
+      setRawValues((prev) => {
+        const next = { ...prev };
+        for (const key of staleKeys) {
+          next[key] = "";
+        }
+        for (const key of AI_EXTRACTABLE_FIELDS) {
+          const v = extracted[key];
+          if (typeof v === "number" && Number.isFinite(v)) {
+            // M3 minor: render AI-extracted 0 as "0" so the field
+            // displays correctly instead of appearing empty.
+            next[key] = String(coerceMonetary(v));
+          }
+        }
+        return next;
+      });
+      // Minor: clear parse errors for keys overwritten or cleared by AI
+      // so a field does not keep a stale red border after a correct value.
+      setParseErrors((prev) => {
+        if (prev.size === 0) return prev;
+        const next = new Set(prev);
+        for (const key of AI_EXTRACTABLE_FIELDS) {
+          if (typeof extracted[key] === "number") {
+            next.delete(key);
+          }
+        }
+        for (const key of staleKeys) {
+          next.delete(key);
+        }
+        return next;
+      });
+      const filled = AI_EXTRACTABLE_FIELDS.filter(
+        (k) => typeof extracted[k] === "number",
+      ).length;
+      setAiNotice(
+        filled > 0
+          ? `تمت تعبئة ${filled} حقل من تحليل الصورة. يمكنك مراجعتها وتعديلها.`
+          : "لم يستطع النموذج استخراج قيم واضحة. يُرجى الإدخال يدويًا.",
+      );
+    } catch (e) {
+      if ((e as Error)?.name === "AbortError") return;
+      if (requestId !== aiRequestIdRef.current) return;
+      setAiError(
+        e instanceof Error
+          ? e.message
+          : "تعذّر تحليل الصورة. يُرجى إدخال البيانات يدويًا.",
+      );
+    } finally {
+      if (requestId === aiRequestIdRef.current) {
+        setAiAnalyzing(false);
+        if (aiAbortRef.current === controller) aiAbortRef.current = null;
+      }
+    }
+  }, [zReportImage]);
+
+  const badgeFor = (key: keyof FinancialFields): FieldBadge => {
+    if (manuallyModifiedFields.includes(key)) return "manual";
+    if (
+      Object.keys(aiExtractedData).length > 0 &&
+      typeof aiExtractedData[key] === "number"
+    ) {
+      return "ai";
+    }
+    return null;
+  };
+
+  const handleSave = useCallback(async () => {
+    if (!selectedBranch) return;
+    if (saving) return;
+    // S1: block save while any field has an unparseable value.
+    if (parseErrors.size > 0) {
+      setSaveError("صحّح القيم غير الصحيحة قبل الحفظ.");
+      return;
+    }
+
+    setSaving(true);
+    setSaveError(null);
+    setWarnings([]);
+    try {
+      const dup = await checkDuplicateClosing(
+        selectedBranch.id,
+        businessDate,
+      );
+      if (dup) {
+        const ok = window.confirm(
+          "يوجد إقفال لهذا الفرع في هذا التاريخ. هل تريد المتابعة؟",
+        );
+        if (!ok) {
+          setSaving(false);
+          return;
+        }
+      }
+
+      const reviewedData: FinancialFields = {
+        ...fields,
+        shortageOrExcess: computeShortageOrExcess(
+          effectiveActualCash,
+          fields.cashSystem,
+        ),
+      };
+
+      // O1: manualActualCash derives from the same single buffer
+      // (rawValues.cashActualHanded). useManualCash controls only
+      // whether this value is persisted as manual_actual_cash.
+      const manualActualCash =
+        useManualCash && rawValues.cashActualHanded !== ""
+          ? coerceMonetary(parseLocalizedNumber(rawValues.cashActualHanded))
+          : undefined;
+
+      const result = await saveClosing({
+        branchId: selectedBranch.id,
+        businessDate,
+        reviewedData,
+        manualActualCash,
+        zReportImageUrl: zReportImage ?? undefined,
+        paymentProofImageUrls:
+          proofImages.length > 0 ? proofImages : undefined,
+        aiExtractedData:
+          Object.keys(aiExtractedData).length > 0 ? aiExtractedData : undefined,
+        manuallyModifiedFields:
+          manuallyModifiedFields.length > 0
+            ? manuallyModifiedFields
+            : undefined,
+      });
+      setClosingId(result.closing.id);
+      setSaveSource(result.source);
+      setWarnings(result.warnings);
+      setStep(3);
+    } catch (e) {
+      setSaveError(
+        e instanceof Error ? e.message : "حدث خطأ أثناء الحفظ",
+      );
+    } finally {
+      setSaving(false);
+    }
+  }, [
+    selectedBranch,
+    businessDate,
+    fields,
+    useManualCash,
+    rawValues,
+    effectiveActualCash,
+    zReportImage,
+    proofImages,
+    aiExtractedData,
+    manuallyModifiedFields,
+    saving,
+    parseErrors,
+  ]);
+
+  // M6: hold the wizard behind the session check so we never flash the
+  // closing form to an unauthenticated visitor.
+  if (!authChecked) {
+    return (
+      <main
+        className="flex min-h-screen items-center justify-center bg-slate-50"
+        dir="rtl"
+      >
+        <div className="flex items-center gap-2 text-slate-500">
+          <Loader2 className="h-5 w-5 animate-spin" />
+          <span className="text-sm">جارٍ التحقق من الجلسة…</span>
+        </div>
+      </main>
+    );
+  }
+
+  return (
+    <main className="mx-auto max-w-3xl px-4 py-10" dir="rtl">
+      <div className="mb-6 flex items-center justify-between gap-3">
+        <button
+          type="button"
+          onClick={handleLogout}
+          className="inline-flex items-center gap-1 text-sm text-slate-600 hover:text-rose-600"
+        >
+          <LogOut className="h-4 w-4" />
+          تسجيل الخروج
+        </button>
+        {authSession?.branchName ? (
+          <span className="rounded-full bg-emerald-50 px-3 py-1 text-xs font-medium text-emerald-700">
+            الجلسة: {authSession.branchName}
+          </span>
+        ) : null}
+      </div>
+      <div className="card-frame p-6">
+        <div className="mb-6 flex items-center gap-3">
+          <Calculator className="h-8 w-8 text-emerald-600" />
+          <h1 className="text-2xl font-bold">شاشة الكاشير</h1>
+        </div>
+        <div className="mb-6 flex items-center justify-center gap-2">
+          {([1, 2, 3] as const).map((s) => (
+            <div
+              key={s}
+              className={`flex h-8 w-8 items-center justify-center rounded-full text-sm font-bold ${
+                step >= s
+                  ? "bg-emerald-600 text-white"
+                  : "bg-slate-200 text-slate-500"
+              }`}
+            >
+              {s}
+            </div>
+          ))}
+        </div>
+
+        {/* Step 1 */}
+        {step === 1 && (
+          <div className="space-y-5">
+            <h2 className="text-lg font-semibold">
+              الخطوة ١: اختيار الفرع والتاريخ
+            </h2>
+            {/* Branch */}
+            <div>
+              <label className="mb-1 block text-sm font-medium text-slate-700">
+                الفرع
+              </label>
+              {branchesLoading ? (
+                <p className="text-sm text-slate-500">جارٍ تحميل الفروع…</p>
+              ) : branchesError ? (
+                <p className="text-sm text-red-600">{branchesError}</p>
+              ) : !isBranchLocked ? (
+                <select
+                  className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
+                  value={selectedBranch?.id ?? ""}
+                  onChange={(e) => {
+                    const b = branches.find(
+                      (x) => x.id === e.target.value,
+                    );
+                    if (b) handlePickBranch(b);
+                  }}
+                >
+                  <option value="">— اختر الفرع —</option>
+                  {branches.map((b) => (
+                    <option key={b.id} value={b.id}>
+                      {b.id} — {b.name}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <div className="flex items-center gap-2 rounded-md bg-slate-100 px-3 py-2">
+                  <Lock className="h-4 w-4 text-slate-500" />
+                  <span className="text-sm font-medium">
+                    {selectedBranch?.id} — {selectedBranch?.name}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={handleConfirmBranchChange}
+                    className="mr-auto text-xs text-emerald-600 hover:underline"
+                  >
+                    تغيير الفرع
+                  </button>
+                </div>
+              )}
+            </div>
+            {/* Date */}
+            <div>
+              <label className="mb-1 block text-sm font-medium text-slate-700">
+                تاريخ العمل
+              </label>
+              <input
+                type="date"
+                className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
+                value={businessDate}
+                onChange={(e) => setBusinessDate(e.target.value)}
+              />
+            </div>
+            {/* Z-Report image */}
+            <div>
+              <label className="mb-1 block text-sm font-medium text-slate-700">
+                صورة تقرير Z (اختياري)
+              </label>
+              <input
+                type="file"
+                accept={ACCEPTED_IMAGE_TYPES}
+                onChange={(e) => onZReport(e.target.files?.[0])}
+                className="block w-full text-sm"
+              />
+              {zReportImage && (
+                /* eslint-disable-next-line @next/next/no-img-element */
+                <img
+                  src={zReportImage}
+                  alt="Z-Report"
+                  className="mt-2 max-h-48 rounded border"
+                />
+              )}
+            </div>
+            {/* Payment proofs */}
+            <div>
+              <label className="mb-1 block text-sm font-medium text-slate-700">
+                صور إثبات الدفع (اختياري)
+              </label>
+              <input
+                type="file"
+                accept={ACCEPTED_IMAGE_TYPES}
+                multiple
+                onChange={(e) => onProofs(e.target.files)}
+                className="block w-full text-sm"
+              />
+              {proofImages.length > 0 && (
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {proofImages.map((img, i) => (
+                    /* eslint-disable-next-line @next/next/no-img-element */
+                    <img
+                      key={i}
+                      src={img}
+                      alt={`Proof ${i + 1}`}
+                      className="h-24 rounded border"
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+            <button
+              type="button"
+              className="w-full rounded-md bg-emerald-600 px-4 py-2 font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+              disabled={!selectedBranch || !businessDate}
+              onClick={() => setStep(2)}
+            >
+              التالي
+            </button>
+          </div>
+        )}
+
+        {/* Step 2 */}
+        {step === 2 && (
+          <div className="space-y-4">
+            <h2 className="text-lg font-semibold">
+              الخطوة ٢: البيانات المالية
+            </h2>
+
+            {/* M3: AI analysis button */}
+            <div className="rounded-md border border-violet-200 bg-violet-50 p-3">
+              <div className="flex items-center gap-2">
+                <Sparkles className="h-4 w-4 text-violet-600" />
+                <span className="text-sm font-medium text-violet-900">
+                  تحليل بالذكاء الاصطناعي
+                </span>
+              </div>
+              <p className="mt-1 text-xs text-violet-800">
+                يستخرج القيم من صورة تقرير Z تلقائيًا. يمكنك دائمًا تعديل أي قيمة بعد الاستخراج.
+              </p>
+              <button
+                type="button"
+                onClick={handleAnalyzeImage}
+                disabled={!zReportImage || aiAnalyzing}
+                className="mt-2 inline-flex w-full items-center justify-center gap-2 rounded-md bg-violet-600 px-4 py-2 text-sm font-medium text-white hover:bg-violet-700 disabled:opacity-50"
+              >
+                {aiAnalyzing ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    جارٍ التحليل…
+                  </>
+                ) : (
+                  <>
+                    <Sparkles className="h-4 w-4" />
+                    تحليل صورة تقرير Z
+                  </>
+                )}
+              </button>
+              {!zReportImage && (
+                <p className="mt-1 text-xs text-violet-700">
+                  عُد للخطوة السابقة لرفع صورة تقرير Z أولًا.
+                </p>
+              )}
+              {aiNotice && (
+                <p className="mt-2 text-xs font-medium text-violet-900">
+                  {aiNotice}
+                </p>
+              )}
+              {aiError && (
+                <div className="mt-2 flex items-start gap-2 rounded bg-red-50 p-2 text-xs text-red-700">
+                  <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                  <span>{aiError}</span>
+                </div>
+              )}
+            </div>
+
+            <NumberInput
+              label="إجمالي المبيعات"
+              value={rawValues.grossSales}
+              onChange={(v) => handleFieldChange("grossSales", v)}
+              badge={badgeFor("grossSales")}
+              error={parseErrors.has("grossSales")}
+            />
+            <NumberInput
+              label="صافي المبيعات"
+              value={rawValues.netSales}
+              onChange={(v) => handleFieldChange("netSales", v)}
+              badge={badgeFor("netSales")}
+              error={parseErrors.has("netSales")}
+            />
+            <NumberInput
+              label="النقدية حسب النظام"
+              value={rawValues.cashSystem}
+              onChange={(v) => handleFieldChange("cashSystem", v)}
+              badge={badgeFor("cashSystem")}
+              error={parseErrors.has("cashSystem")}
+            />
+            {/* O1: Manual actual cash uses the same rawValues.cashActualHanded
+                buffer as the non-manual path. useManualCash controls only the
+                label and whether manual_actual_cash is persisted on save. */}
+            <div className="rounded-md border border-slate-200 p-3">
+              <label className="flex items-center gap-2 text-sm font-medium">
+                <input
+                  type="checkbox"
+                  checked={useManualCash}
+                  onChange={(e) => setUseManualCash(e.target.checked)}
+                />
+                إدخال النقدية الفعلية يدويًا
+              </label>
+              {useManualCash ? (
+                <NumberInput
+                  label="النقدية الفعلية"
+                  value={rawValues.cashActualHanded}
+                  onChange={(v) => handleFieldChange("cashActualHanded", v)}
+                  badge={badgeFor("cashActualHanded")}
+                  error={parseErrors.has("cashActualHanded")}
+                />
+              ) : (
+                <div className="mt-2">
+                  <NumberInput
+                    label="النقدية المسلّمة"
+                    value={rawValues.cashActualHanded}
+                    onChange={(v) => handleFieldChange("cashActualHanded", v)}
+                    badge={badgeFor("cashActualHanded")}
+                    error={parseErrors.has("cashActualHanded")}
+                  />
+                </div>
+              )}
+            </div>
+            <NumberInput
+              label="سبان"
+              value={rawValues.spanSystem}
+              onChange={(v) => handleFieldChange("spanSystem", v)}
+              badge={badgeFor("spanSystem")}
+              error={parseErrors.has("spanSystem")}
+            />
+            <NumberInput
+              label="تطبيقات التوصيل"
+              value={rawValues.deliveryAppsSystem}
+              onChange={(v) => handleFieldChange("deliveryAppsSystem", v)}
+              badge={badgeFor("deliveryAppsSystem")}
+              error={parseErrors.has("deliveryAppsSystem")}
+            />
+            <NumberInput
+              label="حركات مرتجعة"
+              value={rawValues.reversedTransactions}
+              onChange={(v) => handleFieldChange("reversedTransactions", v)}
+              badge={badgeFor("reversedTransactions")}
+              error={parseErrors.has("reversedTransactions")}
+            />
+            {/* Shortage/excess display */}
+            <div className="rounded-md bg-slate-50 p-3">
+              <div className="flex items-center justify-between">
+                <span className="text-sm font-medium">
+                  العجز / الزيادة
+                </span>
+                <span
+                  className={`text-lg font-bold ${
+                    fields.shortageOrExcess < 0
+                      ? "text-red-600"
+                      : fields.shortageOrExcess > 0
+                        ? "text-emerald-600"
+                        : "text-slate-500"
+                  }`}
+                >
+                  {fields.shortageOrExcess.toFixed(2)} ر.س
+                </span>
+              </div>
+            </div>
+            {saveError && (
+              <div className="flex items-center gap-2 rounded-md bg-red-50 p-3 text-sm text-red-700">
+                <AlertCircle className="h-4 w-4 shrink-0" />
+                {saveError}
+              </div>
+            )}
+            {parseErrors.size > 0 && (
+              <p className="text-center text-xs text-red-600">
+                صحّح القيم غير الصحيحة قبل الحفظ
+              </p>
+            )}
+            <div className="flex gap-2">
+              <button
+                type="button"
+                className="flex-1 rounded-md border border-slate-300 px-4 py-2 font-medium text-slate-700 hover:bg-slate-50"
+                onClick={() => setStep(1)}
+              >
+                السابق
+              </button>
+              <button
+                type="button"
+                className="flex-1 rounded-md bg-emerald-600 px-4 py-2 font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+                disabled={saving || parseErrors.size > 0}
+                onClick={handleSave}
+              >
+                {saving ? "جارٍ الحفظ…" : "حفظ الإقفال"}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Step 3 */}
+        {step === 3 && closingId && (
+          <div className="space-y-5 text-center">
+            <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-emerald-100">
+              <Check className="h-8 w-8 text-emerald-600" />
+            </div>
+            <h2 className="text-xl font-bold">تم إنشاء الإقفال</h2>
+            <p className="text-sm text-slate-600">
+              رقم الإقفال:{" "}
+              <span className="font-mono font-bold">{closingId}</span>
+            </p>
+            {saveSource === "local-queued" && (
+              <div className="rounded-md bg-amber-50 p-3">
+                <p className="text-sm font-medium text-amber-800">
+                  تم الحفظ محليًا (وضع عدم الاتصال). يُرجى إعادة الإرسال يدويًا عند توفّر الاتصال.
+                </p>
+              </div>
+            )}
+            {warnings.length > 0 && (
+              <div className="rounded-md bg-amber-50 p-3 text-right">
+                <p className="mb-1 text-xs font-semibold text-amber-900">
+                  تنبيهات:
+                </p>
+                <ul className="space-y-1 text-sm text-amber-800">
+                  {warnings.map((w, i) => (
+                    <li key={i}>• {w}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {saveSource !== "local-queued" && warnings.length === 0 && (
+              <div className="rounded-md bg-amber-50 p-3">
+                <p className="text-sm font-medium text-amber-800">
+                  بانتظار اعتماد الإدارة المالية
+                </p>
+              </div>
+            )}
+            <div className="flex flex-wrap justify-center gap-2">
+              <button
+                type="button"
+                onClick={handleStartNewClosing}
+                className="inline-flex items-center gap-2 rounded-md border border-slate-300 px-4 py-2 font-medium text-slate-700 hover:bg-slate-50"
+              >
+                <RotateCcw className="h-4 w-4" />
+                بدء إقفال جديد
+              </button>
+              <Link
+                href="/"
+                className="inline-block rounded-md bg-emerald-600 px-4 py-2 font-medium text-white hover:bg-emerald-700"
+              >
+                العودة للبوابة
+              </Link>
+            </div>
+          </div>
+        )}
+      </div>
+    </main>
+  );
+}
+
+function FieldBadgePill({ kind }: { kind: "ai" | "manual" }) {
+  if (kind === "ai") {
+    return (
+      <span className="rounded bg-violet-100 px-1.5 py-0.5 text-[10px] font-semibold text-violet-700">
+        ذكاء اصطناعي
+      </span>
+    );
+  }
+  return (
+    <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold text-amber-700">
+      معدّل يدويًا
+    </span>
+  );
+}
+
+function NumberInput({
+  label,
+  value,
+  onChange,
+  badge,
+  error,
+}: {
+  label: string;
+  value: string;
+  onChange: (val: string) => void;
+  badge?: FieldBadge;
+  error?: boolean;
+}) {
+  return (
+    <div>
+      <label className="mb-1 flex items-center gap-2 text-sm font-medium text-slate-700">
+        <span>{label}</span>
+        {badge && <FieldBadgePill kind={badge} />}
+      </label>
+      <input
+        type="text"
+        inputMode="decimal"
+        className={`w-full rounded-md border px-3 py-2 text-sm ${
+          error ? "border-red-400" : "border-slate-300"
+        }`}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+      />
+      {error && (
+        <p className="mt-1 text-xs text-red-600">
+          قيمة غير صحيحة
+        </p>
+      )}
+    </div>
+  );
+}
+===ENDFILE===
+
+===FILE: app/auditor/page.tsx===
+"use client";
+
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  type ReactNode,
+} from "react";
+import { useRouter } from "next/navigation";
+import {
+  AlertTriangle,
+  CheckCircle2,
+  Clock,
+  Download,
+  FileText,
+  History,
+  ImageOff,
+  Loader2,
+  Lock,
+  LogOut,
+  Printer,
+  Search,
+  ShieldCheck,
+  Sparkles,
+  X,
+  XCircle,
+} from "lucide-react";
+import {
+  AuditAction,
+  ClosingStatus,
+  DailyClosingAuditLog,
+  FinancialFields,
+  UserRole,
+  computeShortageOrExcess,
+} from "../types";
+import {
+  approveClosing,
+  countPendingClosings,
+  getClosing,
+  listAuditLogs,
+  listClosings,
+  rejectClosing,
+  resolveImageUrl,
+  resolveImageUrls,
+  type ClosingWithBranch,
+} from "../lib/closings";
+import { clearSession, requireRole } from "../lib/auth";
+
+type TabId = "approvals" | "reports" | "audit";
+type StatusFilter = "all" | ClosingStatus;
+
+const STATUS_LABEL: Record<ClosingStatus, string> = {
+  pending: "قيد المراجعة",
+  approved: "معتمد",
+  rejected: "مرفوض",
+};
+
+const ACTION_LABEL: Record<AuditAction, string> = {
+  uploaded: "رفع الصور",
+  ai_extracted: "استخراج آلي للبيانات",
+  cashier_confirmed: "تأكيد الكاشير",
+  approved: "اعتماد المراجع",
+  rejected: "رفض المراجع",
+  modified: "تعديل يدوي",
+};
+
+const ROLE_LABEL: Record<UserRole, string> = {
+  cashier: "الكاشير",
+  manager: "المدير",
+  auditor: "المراجع المالي",
+  ai: "الذكاء الاصطناعي",
+};
+
+const FIELD_LABEL: Record<keyof FinancialFields, string> = {
+  grossSales: "إجمالي المبيعات",
+  netSales: "صافي المبيعات",
+  cashSystem: "النقدية حسب النظام",
+  cashActualHanded: "النقدية المسلّمة فعليًا",
+  spanSystem: "سبان",
+  deliveryAppsSystem: "تطبيقات التوصيل",
+  reversedTransactions: "المرتجعات / المستردة",
+  shortageOrExcess: "العجز / الزيادة",
+};
+
+const FIELD_ORDER: (keyof FinancialFields)[] = [
+  "grossSales",
+  "netSales",
+  "cashSystem",
+  "cashActualHanded",
+  "spanSystem",
+  "deliveryAppsSystem",
+  "reversedTransactions",
+  "shortageOrExcess",
+];
+
+function formatSAR(n: number | undefined | null): string {
+  const v = typeof n === "number" && Number.isFinite(n) ? n : 0;
+  return `${v.toLocaleString("en-US", {
+    maximumFractionDigits: 2,
+    minimumFractionDigits: 2,
+  })} ر.س`;
+}
+
+function formatShortageOrExcess(
+  reviewed: Partial<FinancialFields> | undefined,
+): number {
+  if (reviewed?.shortageOrExcess !== undefined) {
+    return reviewed.shortageOrExcess;
+  }
+  return computeShortageOrExcess(
+    reviewed?.cashActualHanded ?? 0,
+    reviewed?.cashSystem ?? 0,
+  );
+}
+
+function formatDate(iso: string): string {
+  try {
+    return new Date(iso).toLocaleDateString("ar-SA-u-ca-gregory", {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+    });
+  } catch {
+    return iso;
+  }
+}
+
+function formatDateTime(iso: string): string {
+  try {
+    return new Date(iso).toLocaleString("ar-SA-u-ca-gregory", {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch {
+    return iso;
+  }
+}
+
+function StatusBadge({ status }: { status: ClosingStatus }) {
+  const styles: Record<ClosingStatus, string> = {
+    pending: "bg-amber-100 text-amber-800 ring-amber-200",
+    approved: "bg-emerald-100 text-emerald-800 ring-emerald-200",
+    rejected: "bg-rose-100 text-rose-800 ring-rose-200",
+  };
+  return (
+    <span
+      className={`inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-medium ring-1 ring-inset ${styles[status]}`}
+    >
+      {status === "pending" && <Clock className="h-3 w-3" />}
+      {status === "approved" && <CheckCircle2 className="h-3 w-3" />}
+      {status === "rejected" && <XCircle className="h-3 w-3" />}
+      {STATUS_LABEL[status]}
+    </span>
+  );
+}
+
+function ActionIcon({ action }: { action: AuditAction }) {
+  const cls = "h-4 w-4";
+  switch (action) {
+    case "approved":
+      return <CheckCircle2 className={`${cls} text-emerald-600`} />;
+    case "rejected":
+      return <XCircle className={`${cls} text-rose-600`} />;
+    case "ai_extracted":
+      return <Sparkles className={`${cls} text-indigo-600`} />;
+    case "uploaded":
+      return <FileText className={`${cls} text-slate-500`} />;
+    case "modified":
+      return <AlertTriangle className={`${cls} text-amber-600`} />;
+    default:
+      return <CheckCircle2 className={`${cls} text-slate-500`} />;
+  }
+}
+
+function Metric({
+  label,
+  value,
+  tone,
+}: {
+  label: string;
+  value: string;
+  tone?: "rose" | "amber" | "emerald";
+}) {
+  const toneCls =
+    tone === "rose"
+      ? "text-rose-700"
+      : tone === "amber"
+        ? "text-amber-700"
+        : tone === "emerald"
+          ? "text-emerald-700"
+          : "text-slate-900";
+  return (
+    <div>
+      <div className="text-xs text-slate-500">{label}</div>
+      <div className={`mt-0.5 text-sm font-semibold ${toneCls}`}>{value}</div>
+    </div>
+  );
+}
+
+function KpiCard({
+  label,
+  value,
+  tone,
+}: {
+  label: string;
+  value: string;
+  tone?: "rose" | "amber" | "neutral";
+}) {
+  const toneCls =
+    tone === "rose"
+      ? "text-rose-700"
+      : tone === "amber"
+        ? "text-amber-700"
+        : "text-slate-900";
+  return (
+    <div className="rounded-md border border-slate-200 bg-white p-4">
+      <div className="text-xs text-slate-500">{label}</div>
+      <div className={`mt-1 text-lg font-bold ${toneCls}`}>{value}</div>
+    </div>
+  );
+}
+
+function Spinner({ label }: { label: string }) {
+  return (
+    <div className="flex items-center justify-center py-12 text-slate-500">
+      <Loader2 className="ml-2 h-5 w-5 animate-spin" />
+      {label}
+    </div>
+  );
+}
+
+function ErrorBox({ message }: { message: string }) {
+  return (
+    <div className="flex items-start gap-2 rounded-md border border-rose-200 bg-rose-50 p-4 text-sm text-rose-800">
+      <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+      <span>{message}</span>
+    </div>
+  );
+}
+
+export default function AuditorPage() {
+  const router = useRouter();
+  const [tab, setTab] = useState<TabId>("approvals");
+
+  // M6: login gateway guard — auditor (or admin) session required.
+  const [authChecked, setAuthChecked] = useState(false);
+
+  useEffect(() => {
+    const session = requireRole("auditor", "admin");
+    if (!session) {
+      router.replace("/");
+      return;
+    }
+    setAuthChecked(true);
+  }, [router]);
+
+  function handleLogout() {
+    clearSession();
+    router.replace("/");
+  }
+
+  if (!authChecked) {
+    return (
+      <main
+        className="flex min-h-screen items-center justify-center bg-slate-50"
+        dir="rtl"
+      >
+        <div className="flex items-center gap-2 text-slate-500">
+          <Loader2 className="h-5 w-5 animate-spin" />
+          <span className="text-sm">جارٍ التحقق من الجلسة…</span>
+        </div>
+      </main>
+    );
+  }
+
+  return (
+    <main className="min-h-screen bg-slate-50">
+      <header className="border-b border-slate-200 bg-white">
+        <div className="mx-auto max-w-6xl px-4 py-5">
+          <div className="flex items-center justify-between">
+            <button
+              type="button"
+              onClick={handleLogout}
+              className="inline-flex items-center gap-1 text-sm text-slate-600 hover:text-rose-600"
+            >
+              <LogOut className="h-4 w-4" />
+              تسجيل الخروج
+            </button>
+            <div className="flex items-center gap-2 text-amber-700">
+              <ShieldCheck className="h-5 w-5" />
+              <span className="text-sm font-medium">المراجعة المالية</span>
+            </div>
+          </div>
+          <h1 className="mt-3 text-xl font-bold text-slate-900">
+            بوابة المراجعة المالية والاعتماد
+          </h1>
+          <p className="mt-1 text-sm text-slate-600">
+            اعتماد الإقفالات اليومية، التقارير الموحّدة، وسجل التدقيق الرقمي.
+          </p>
+        </div>
+      </header>
+
+      <div className="mx-auto max-w-6xl px-4 py-6">
+        <div
+          className="mb-6 flex gap-1 rounded-lg bg-slate-100 p-1"
+          role="tablist"
+        >
+          <TabButton
+            id="approvals"
+            active={tab}
+            onClick={setTab}
+            icon={<FileText className="h-4 w-4" />}
+            label="الاعتماد"
+          />
+          <TabButton
+            id="reports"
+            active={tab}
+            onClick={setTab}
+            icon={<ShieldCheck className="h-4 w-4" />}
+            label="التقارير الموحّدة"
+          />
+          <TabButton
+            id="audit"
+            active={tab}
+            onClick={setTab}
+            icon={<History className="h-4 w-4" />}
+            label="سجل التدقيق"
+          />
+        </div>
+
+        {tab === "approvals" && <ApprovalsTab />}
+        {tab === "reports" && <ReportsTab />}
+        {tab === "audit" && <AuditLogTab />}
+      </div>
+    </main>
+  );
+}
+
+function TabButton({
+  id,
+  active,
+  onClick,
+  icon,
+  label,
+}: {
+  id: TabId;
+  active: TabId;
+  onClick: (id: TabId) => void;
+  icon: ReactNode;
+  label: string;
+}) {
+  const isActive = active === id;
+  return (
+    <button
+      type="button"
+      role="tab"
+      aria-selected={isActive}
+      onClick={() => onClick(id)}
+      className={`flex flex-1 items-center justify-center gap-2 rounded-md px-3 py-2 text-sm font-medium transition ${
+        isActive
+          ? "bg-white text-slate-900 shadow-sm"
+          : "text-slate-600 hover:text-slate-900"
+      }`}
+    >
+      {icon}
+      {label}
+    </button>
+  );
+}
+
+// ============================================================================
+// Tab 1 — Approvals
+// ============================================================================
+
+function ApprovalsTab() {
+  const [filter, setFilter] = useState<StatusFilter>("all");
+  const [list, setList] = useState<ClosingWithBranch[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [search, setSearch] = useState("");
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const data = await listClosings(filter);
+      setList(data);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "حدث خطأ غير متوقع.");
+    } finally {
+      setLoading(false);
+    }
+  }, [filter]);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  const filtered = useMemo(() => {
+    if (!search.trim()) return list;
+    const q = search.trim().toLowerCase();
+    return list.filter(
+      (c) =>
+        c.id.toLowerCase().includes(q) ||
+        c.branchName.toLowerCase().includes(q) ||
+        c.businessDate.includes(q),
+    );
+  }, [list, search]);
+
+  return (
+    <div>
+      <div className="mb-4 flex flex-wrap items-center gap-2">
+        {(["all", "pending", "approved", "rejected"] as StatusFilter[]).map(
+          (f) => (
+            <button
+              key={f}
+              type="button"
+              onClick={() => setFilter(f)}
+              className={`rounded-md px-3 py-1.5 text-sm font-medium transition ${
+                filter === f
+                  ? "bg-slate-900 text-white"
+                  : "bg-white text-slate-700 ring-1 ring-slate-200 hover:bg-slate-100"
+              }`}
+            >
+              {f === "all" ? "الكل" : STATUS_LABEL[f]}
+            </button>
+          ),
+        )}
+        <div className="relative mr-auto">
+          <Search className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+          <input
+            type="text"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="بحث برقم الإقفال أو الفرع أو التاريخ..."
+            className="w-72 rounded-md border border-slate-200 bg-white py-1.5 pr-9 pl-3 text-sm focus:border-slate-400 focus:outline-none"
+          />
+        </div>
+      </div>
+
+      {loading && <Spinner label="جارٍ تحميل الإقفالات..." />}
+      {!loading && error && <ErrorBox message={error} />}
+      {!loading && !error && filtered.length === 0 && (
+        <div className="rounded-md border border-slate-200 bg-white p-8 text-center text-slate-500">
+          لا توجد إقفالات مطابقة.
+        </div>
+      )}
+
+      {!loading && !error && filtered.length > 0 && (
+        <div className="grid gap-3">
+          {filtered.map((c) => {
+            const soe = formatShortageOrExcess(c.reviewedData);
+            return (
+              <button
+                key={c.id}
+                type="button"
+                onClick={() => setSelectedId(c.id)}
+                className="rounded-md border border-slate-200 bg-white p-4 text-right shadow-sm transition hover:border-slate-300 hover:shadow"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <div className="font-mono text-xs text-slate-500">
+                      {c.id}
+                    </div>
+                    <div className="mt-0.5 font-semibold text-slate-900">
+                      {c.branchName}
+                    </div>
+                    <div className="mt-1 text-sm text-slate-600">
+                      {formatDate(c.businessDate)}
+                    </div>
+                  </div>
+                  <StatusBadge status={c.status} />
+                </div>
+                <div className="mt-3 grid grid-cols-3 gap-2 border-t border-slate-100 pt-3">
+                  <Metric
+                    label="النقدية المسلّمة"
+                    value={formatSAR(c.reviewedData?.cashActualHanded)}
+                  />
+                  <Metric
+                    label="النقدية حسب النظام"
+                    value={formatSAR(c.reviewedData?.cashSystem)}
+                  />
+                  <Metric
+                    label="العجز / الزيادة"
+                    value={formatSAR(soe)}
+                    tone={soe < 0 ? "rose" : soe > 0 ? "amber" : undefined}
+                  />
+                </div>
+                {c.manuallyModifiedFields &&
+                  c.manuallyModifiedFields.length > 0 && (
+                    <div className="mt-2 inline-flex items-center gap-1 rounded bg-amber-50 px-2 py-0.5 text-xs text-amber-800">
+                      <AlertTriangle className="h-3 w-3" />
+                      توجد حقول معدّلة يدويًا ({c.manuallyModifiedFields.length})
+                    </div>
+                  )}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      {selectedId && (
+        <ClosingDetailModal
+          id={selectedId}
+          onClose={() => setSelectedId(null)}
+          onActionComplete={() => {
+            setSelectedId(null);
+            refresh();
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function ClosingDetailModal({
+  id,
+  onClose,
+  onActionComplete,
+}: {
+  id: string;
+  onClose: () => void;
+  onActionComplete: () => void;
+}) {
+  const [closing, setClosing] = useState<ClosingWithBranch | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [zUrl, setZUrl] = useState<string | null>(null);
+  const [proofUrls, setProofUrls] = useState<string[]>([]);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [comment, setComment] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
+  const [done, setDone] = useState<null | "approved" | "rejected">(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setLoadError(null);
+    setClosing(null);
+    setZUrl(null);
+    setProofUrls([]);
+    (async () => {
+      try {
+        const c = await getClosing(id);
+        if (cancelled || !c) {
+          if (!cancelled) {
+            setLoading(false);
+            if (!c) setLoadError("تعذّر العثور على الإقفال.");
+          }
+          return;
+        }
+        setClosing(c);
+        const [z, ps] = await Promise.all([
+          c.zReportImageUrl
+            ? resolveImageUrl(c.zReportImageUrl)
+            : Promise.resolve(null),
+          c.paymentProofImageUrls && c.paymentProofImageUrls.length > 0
+            ? resolveImageUrls(c.paymentProofImageUrls)
+            : Promise.resolve<string[]>([]),
+        ]);
+        if (cancelled) return;
+        setZUrl(z);
+        setProofUrls(ps);
+      } catch (e) {
+        if (!cancelled) {
+          setLoadError(
+            e instanceof Error ? e.message : "تعذّر تحميل بيانات الإقفال.",
+          );
+        }
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [id]);
+
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape" && !submitting) onClose();
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose, submitting]);
+
+  async function handleApprove() {
+    if (!closing) return;
+    if (closing.status !== "pending") return;
+    setSubmitting(true);
+    setFormError(null);
+    try {
+      await approveClosing(id, comment.trim() || undefined);
+      setDone("approved");
+      setTimeout(() => onActionComplete(), 800);
+    } catch (e) {
+      setFormError(e instanceof Error ? e.message : "حدث خطأ أثناء الاعتماد.");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function handleReject() {
+    if (!closing) return;
+    if (closing.status !== "pending") return;
+    if (!comment.trim()) {
+      setFormError("سبب الرفض مطلوب.");
+      return;
+    }
+    setSubmitting(true);
+    setFormError(null);
+    try {
+      await rejectClosing(id, comment.trim());
+      setDone("rejected");
+      setTimeout(() => onActionComplete(), 800);
+    } catch (e) {
+      setFormError(e instanceof Error ? e.message : "حدث خطأ أثناء الرفض.");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  const soe =
+    closing?.reviewedData !== undefined
+      ? formatShortageOrExcess(closing.reviewedData)
+      : 0;
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-slate-900/50 p-4 backdrop-blur-sm"
+      onClick={(e) => {
+        if (e.target === e.currentTarget && !submitting) onClose();
+      }}
+    >
+      <div className="my-4 w-full max-w-4xl rounded-lg bg-white shadow-xl">
+        <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3">
+          <div>
+            <div className="font-mono text-xs text-slate-500">{id}</div>
+            <h2 className="text-base font-bold text-slate-900">
+              تفاصيل الإقفال
+            </h2>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={submitting}
+            className="rounded-md p-1.5 text-slate-500 hover:bg-slate-100 hover:text-slate-700 disabled:opacity-50"
+            aria-label="إغلاق"
+          >
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+
+        <div className="max-h-[70vh] overflow-y-auto px-5 py-4">
+          {loading && <Spinner label="جارٍ التحميل..." />}
+          {!loading && loadError && <ErrorBox message={loadError} />}
+          {!loading && !loadError && closing && (
+            <div className="space-y-5">
+              {/* Header info */}
+              <div className="flex flex-wrap items-center gap-3 rounded-md border border-slate-200 bg-slate-50 p-3">
+                <div className="flex-1">
+                  <div className="text-xs text-slate-500">الفرع</div>
+                  <div className="font-semibold text-slate-900">
+                    {closing.branchName}
+                    {closing.branchCity ? ` — ${closing.branchCity}` : ""}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-xs text-slate-500">تاريخ العمل</div>
+                  <div className="font-semibold text-slate-900">
+                    {formatDate(closing.businessDate)}
+                  </div>
+                </div>
+                <StatusBadge status={closing.status} />
+              </div>
+
+              {/* Z-report */}
+              <section>
+                <h3 className="mb-2 text-sm font-semibold text-slate-700">
+                  تقرير Z
+                </h3>
+                {zUrl ? (
+                  <a
+                    href={zUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="block overflow-hidden rounded-md border border-slate-200"
+                  >
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={zUrl}
+                      alt="تقرير Z"
+                      className="max-h-96 w-full object-contain bg-slate-50"
+                    />
+                  </a>
+                ) : (
+                  <div className="flex items-center gap-2 rounded-md border border-dashed border-slate-300 bg-slate-50 p-6 text-sm text-slate-500">
+                    <ImageOff className="h-4 w-4" />
+                    لا توجد صورة لتقرير Z أو تعذّر تحميلها.
+                  </div>
+                )}
+              </section>
+
+              {/* Payment proofs */}
+              {proofUrls.length > 0 && (
+                <section>
+                  <h3 className="mb-2 text-sm font-semibold text-slate-700">
+                    صور إثبات الدفع ({proofUrls.length})
+                  </h3>
+                  <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                    {proofUrls.map((url, idx) => (
+                      <a
+                        key={idx}
+                        href={url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="block overflow-hidden rounded-md border border-slate-200"
+                      >
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img
+                          src={url}
+                          alt={`إثبات ${idx + 1}`}
+                          className="h-32 w-full object-cover bg-slate-50"
+                        />
+                      </a>
+                    ))}
+                  </div>
+                </section>
+              )}
+
+              {/* Field comparison */}
+              <section>
+                <h3 className="mb-2 text-sm font-semibold text-slate-700">
+                  المراجعة المالية
+                </h3>
+                <div className="overflow-hidden rounded-md border border-slate-200">
+                  <table className="w-full text-sm">
+                    <thead className="bg-slate-50 text-slate-500">
+                      <tr>
+                        <th className="px-3 py-2 text-right font-medium">
+                          الحقل
+                        </th>
+                        <th className="px-3 py-2 text-right font-medium">
+                          القيمة المستخرجة آليًا
+                        </th>
+                        <th className="px-3 py-2 text-right font-medium">
+                          القيمة المعتمدة من الكاشير
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {FIELD_ORDER.map((k) => {
+                        const ai = closing.aiExtractedData?.[k];
+                        const reviewed = closing.reviewedData?.[k];
+                        if (ai === undefined && reviewed === undefined) {
+                          return null;
+                        }
+                        const modified = new Set(
+                          closing.manuallyModifiedFields ?? [],
+                        ).has(k);
+                        const isSoe = k === "shortageOrExcess";
+                        const reviewedValue =
+                          isSoe && reviewed === undefined ? soe : reviewed;
+                        return (
+                          <tr
+                            key={k}
+                            className={modified ? "bg-amber-50" : ""}
+                          >
+                            <td className="px-3 py-2 text-slate-700">
+                              {FIELD_LABEL[k]}
+                              {modified && (
+                                <span className="mr-1 inline-flex items-center gap-0.5 rounded bg-amber-200 px-1 text-[10px] text-amber-900">
+                                  <AlertTriangle className="h-2.5 w-2.5" />
+                                  معدّل
+                                </span>
+                              )}
+                            </td>
+                            <td className="px-3 py-2 font-mono text-slate-600">
+                              {ai !== undefined ? formatSAR(ai) : "—"}
+                            </td>
+                            <td
+                              className={`px-3 py-2 font-mono ${
+                                modified
+                                  ? "font-bold text-amber-900"
+                                  : isSoe && typeof reviewedValue === "number"
+                                    ? reviewedValue < 0
+                                      ? "text-rose-700"
+                                      : reviewedValue > 0
+                                        ? "text-amber-700"
+                                        : "text-slate-900"
+                                    : "text-slate-900"
+                              }`}
+                            >
+                              {reviewedValue !== undefined
+                                ? formatSAR(reviewedValue)
+                                : "—"}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+
+              {/* AI confidence */}
+              {closing.aiConfidence &&
+                Object.keys(closing.aiConfidence).length > 0 && (
+                  <section>
+                    <h3 className="mb-2 text-sm font-semibold text-slate-700">
+                      ثقة الاستخراج الآلي
+                    </h3>
+                    <div className="flex flex-wrap gap-2">
+                      {FIELD_ORDER.map((k) => {
+                        const c = closing.aiConfidence?.[k];
+                        if (c === undefined) return null;
+                        const pct = Math.round((c ?? 0) * 100);
+                        const tone =
+                          pct >= 85
+                            ? "bg-emerald-100 text-emerald-800"
+                            : pct >= 60
+                              ? "bg-amber-100 text-amber-800"
+                              : "bg-rose-100 text-rose-800";
+                        return (
+                          <span
+                            key={k}
+                            className={`rounded px-2 py-0.5 text-xs ${tone}`}
+                          >
+                            {FIELD_LABEL[k]}: {pct}%
+                          </span>
+                        );
+                      })}
+                    </div>
+                  </section>
+                )}
+
+              {/* Auditor action history */}
+              {closing.status !== "pending" && (
+                <section className="rounded-md border border-slate-200 bg-slate-50 p-3 text-sm">
+                  <div className="font-semibold text-slate-700">
+                    قرار المراجع
+                  </div>
+                  <div className="mt-1 text-slate-600">
+                    {closing.status === "approved"
+                      ? "تم الاعتماد"
+                      : "تم الرفض"}
+                    {closing.auditorReviewedAt &&
+                      ` — ${formatDateTime(closing.auditorReviewedAt)}`}
+                  </div>
+                  {closing.auditorComment && (
+                    <div className="mt-2 rounded bg-white px-3 py-2 text-slate-700">
+                      «{closing.auditorComment}»
+                    </div>
+                  )}
+                </section>
+              )}
+
+              {/* Action panel for pending */}
+              {closing.status === "pending" && !done && (
+                <section className="rounded-md border border-slate-200 p-3">
+                  <h3 className="mb-2 text-sm font-semibold text-slate-700">
+                    قرار المراجعة
+                  </h3>
+                  <textarea
+                    value={comment}
+                    onChange={(e) => setComment(e.target.value)}
+                    placeholder="ملاحظة المراجع (مطلوبة عند الرفض، اختيارية عند الاعتماد)"
+                    rows={3}
+                    className="w-full rounded-md border border-slate-200 px-3 py-2 text-sm focus:border-slate-400 focus:outline-none"
+                    disabled={submitting}
+                  />
+                  {formError && (
+                    <div className="mt-2 text-sm text-rose-700">{formError}</div>
+                  )}
+                  <div className="mt-3 flex gap-2">
+                    <button
+                      type="button"
+                      onClick={handleApprove}
+                      disabled={submitting}
+                      className="inline-flex items-center gap-1 rounded-md bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+                    >
+                      {submitting ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <CheckCircle2 className="h-4 w-4" />
+                      )}
+                      اعتماد
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleReject}
+                      disabled={submitting}
+                      className="inline-flex items-center gap-1 rounded-md bg-rose-600 px-4 py-2 text-sm font-medium text-white hover:bg-rose-700 disabled:opacity-50"
+                    >
+                      {submitting ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <XCircle className="h-4 w-4" />
+                      )}
+                      رفض
+                    </button>
+                  </div>
+                </section>
+              )}
+
+              {done && (
+                <section
+                  className={`rounded-md border p-4 text-center ${
+                    done === "approved"
+                      ? "border-emerald-200 bg-emerald-50 text-emerald-800"
+                      : "border-rose-200 bg-rose-50 text-rose-800"
+                  }`}
+                >
+                  {done === "approved" ? (
+                    <CheckCircle2 className="mx-auto h-8 w-8" />
+                  ) : (
+                    <XCircle className="mx-auto h-8 w-8" />
+                  )}
+                  <div className="mt-2 font-semibold">
+                    {done === "approved"
+                      ? "تم اعتماد الإقفال بنجاح"
+                      : "تم رفض الإقفال"}
+                  </div>
+                </section>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// Tab 2 — Unified reports (gated)
+// ============================================================================
+
+interface BranchAggregate {
+  branchId: string;
+  name: string;
+  count: number;
+  gross: number;
+  cash: number;
+  soe: number;
+  reversals: number;
+}
+
+function ReportsTab() {
+  const [pendingCount, setPendingCount] = useState<number | null>(null);
+  const [list, setList] = useState<ClosingWithBranch[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [fromDate, setFromDate] = useState("");
+  const [toDate, setToDate] = useState("");
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const pending = await countPendingClosings();
+      setPendingCount(pending);
+      if (pending === 0) {
+        const data = await listClosings("approved");
+        setList(data);
+      } else {
+        setList([]);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "حدث خطأ غير متوقع.");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  const filtered = useMemo(() => {
+    return list.filter((c) => {
+      if (fromDate && c.businessDate < fromDate) return false;
+      if (toDate && c.businessDate > toDate) return false;
+      return true;
+    });
+  }, [list, fromDate, toDate]);
+
+  const kpis = useMemo(() => {
+    const totals = {
+      grossSales: 0,
+      cashActualHanded: 0,
+      shortageOrExcess: 0,
+      reversedTransactions: 0,
+    };
+    for (const c of filtered) {
+      totals.grossSales += c.reviewedData?.grossSales ?? 0;
+      totals.cashActualHanded += c.reviewedData?.cashActualHanded ?? 0;
+      totals.shortageOrExcess += formatShortageOrExcess(c.reviewedData);
+      totals.reversedTransactions += c.reviewedData?.reversedTransactions ?? 0;
+    }
+    return totals;
+  }, [filtered]);
+
+  const byBranch = useMemo<BranchAggregate[]>(() => {
+    const map = new Map<string, BranchAggregate>();
+    for (const c of filtered) {
+      const cur =
+        map.get(c.branchId) ??
+        ({
+          branchId: c.branchId,
+          name: c.branchName,
+          count: 0,
+          gross: 0,
+          cash: 0,
+          soe: 0,
+          reversals: 0,
+        } as BranchAggregate);
+      cur.count += 1;
+      cur.gross += c.reviewedData?.grossSales ?? 0;
+      cur.cash += c.reviewedData?.cashActualHanded ?? 0;
+      cur.soe += formatShortageOrExcess(c.reviewedData);
+      cur.reversals += c.reviewedData?.reversedTransactions ?? 0;
+      map.set(c.branchId, cur);
+    }
+    return Array.from(map.values()).sort((a, b) => b.gross - a.gross);
+  }, [filtered]);
+
+  function exportCsv() {
+    const rows: string[][] = [
+      [
+        "الفرع",
+        "تاريخ العمل",
+        "إجمالي المبيعات",
+        "النقدية المسلّمة",
+        "النقدية حسب النظام",
+        "العجز/الزيادة",
+        "المرتجعات",
+      ],
+      ...filtered.map((c) => {
+        const soe = formatShortageOrExcess(c.reviewedData);
+        return [
+          c.branchName,
+          c.businessDate,
+          String(c.reviewedData?.grossSales ?? 0),
+          String(c.reviewedData?.cashActualHanded ?? 0),
+          String(c.reviewedData?.cashSystem ?? 0),
+          String(soe),
+          String(c.reviewedData?.reversedTransactions ?? 0),
+        ];
+      }),
+    ];
+    const csv = rows
+      .map((r) =>
+        r.map((cell) => `"${cell.replace(/"/g, '""')}"`).join(","),
+      )
+      .join("\n");
+    const blob = new Blob(["\uFEFF" + csv], {
+      type: "text/csv;charset=utf-8;",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `unified-report-${new Date()
+      .toISOString()
+      .slice(0, 10)}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  if (loading) return <Spinner label="جارٍ التحقق من حالة الإقفالات..." />;
+  if (error) return <ErrorBox message={error} />;
+  if (pendingCount !== null && pendingCount > 0) {
+    return (
+      <div className="rounded-md border border-amber-300 bg-amber-50 p-6 text-center">
+        <Lock className="mx-auto h-9 w-9 text-amber-600" />
+        <h3 className="mt-3 text-lg font-bold text-amber-900">
+          التقارير الموحّدة مغلقة مؤقتًا
+        </h3>
+        <p className="mx-auto mt-2 max-w-xl text-sm leading-6 text-amber-800">
+          يوجد حاليًا{" "}
+          <span className="font-bold">
+            {pendingCount.toLocaleString("ar-SA")}
+          </span>{" "}
+          إقفال قيد المراجعة. اعتمد أو ارفض جميع الإقفالات المعلّقة من تبويب
+          «الاعتماد» لفتح التقارير الموحّدة وضمان دقّتها.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <div className="mb-4 flex flex-wrap items-end gap-3 rounded-md border border-slate-200 bg-white p-3">
+        <div>
+          <label className="block text-xs text-slate-500">من تاريخ</label>
+          <input
+            type="date"
+            value={fromDate}
+            onChange={(e) => setFromDate(e.target.value)}
+            className="mt-1 rounded-md border border-slate-200 px-3 py-1.5 text-sm focus:border-slate-400 focus:outline-none"
+          />
+        </div>
+        <div>
+          <label className="block text-xs text-slate-500">إلى تاريخ</label>
+          <input
+            type="date"
+            value={toDate}
+            onChange={(e) => setToDate(e.target.value)}
+            className="mt-1 rounded-md border border-slate-200 px-3 py-1.5 text-sm focus:border-slate-400 focus:outline-none"
+          />
+        </div>
+        {(fromDate || toDate) && (
+          <button
+            type="button"
+            onClick={() => {
+              setFromDate("");
+              setToDate("");
+            }}
+            className="text-sm text-slate-500 hover:text-slate-700"
+          >
+            إعادة ضبط
+          </button>
+        )}
+        <div className="mr-auto flex gap-2">
+          <button
+            type="button"
+            onClick={exportCsv}
+            disabled={filtered.length === 0}
+            className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+          >
+            <Download className="h-4 w-4" />
+            تصدير CSV
+          </button>
+          <button
+            type="button"
+            onClick={() => window.print()}
+            disabled={filtered.length === 0}
+            className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+          >
+            <Printer className="h-4 w-4" />
+            طباعة
+          </button>
+        </div>
+      </div>
+
+      <div className="mb-6 grid grid-cols-2 gap-3 md:grid-cols-4">
+        <KpiCard
+          label="إجمالي المبيعات"
+          value={formatSAR(kpis.grossSales)}
+        />
+        <KpiCard
+          label="النقدية المسلّمة"
+          value={formatSAR(kpis.cashActualHanded)}
+        />
+        <KpiCard
+          label="صافي العجز / الزيادة"
+          value={formatSAR(kpis.shortageOrExcess)}
+          tone={
+            kpis.shortageOrExcess < 0
+              ? "rose"
+              : kpis.shortageOrExcess > 0
+                ? "amber"
+                : "neutral"
+          }
+        />
+        <KpiCard
+          label="المرتجعات / المستردة"
+          value={formatSAR(kpis.reversedTransactions)}
+        />
+      </div>
+
+      <div className="overflow-hidden rounded-md border border-slate-200 bg-white">
+        <div className="border-b border-slate-200 bg-slate-50 px-4 py-2.5 text-sm font-semibold text-slate-700">
+          ملخّص حسب الفرع ({filtered.length} إقفال)
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="bg-slate-50 text-slate-500">
+              <tr>
+                <th className="px-4 py-2 text-right font-medium">الفرع</th>
+                <th className="px-4 py-2 text-right font-medium">
+                  عدد الإقفالات
+                </th>
+                <th className="px-4 py-2 text-right font-medium">
+                  إجمالي المبيعات
+                </th>
+                <th className="px-4 py-2 text-right font-medium">
+                  النقدية المسلّمة
+                </th>
+                <th className="px-4 py-2 text-right font-medium">
+                  العجز / الزيادة
+                </th>
+                <th className="px-4 py-2 text-right font-medium">
+                  المرتجعات
+                </th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {byBranch.map((b) => (
+                <tr key={b.branchId}>
+                  <td className="px-4 py-2 font-medium text-slate-900">
+                    {b.name}
+                  </td>
+                  <td className="px-4 py-2 text-slate-600">
+                    {b.count.toLocaleString("ar-SA")}
+                  </td>
+                  <td className="px-4 py-2 font-mono text-slate-900">
+                    {formatSAR(b.gross)}
+                  </td>
+                  <td className="px-4 py-2 font-mono text-slate-700">
+                    {formatSAR(b.cash)}
+                  </td>
+                  <td
+                    className={`px-4 py-2 font-mono ${
+                      b.soe < 0
+                        ? "text-rose-700"
+                        : b.soe > 0
+                          ? "text-amber-700"
+                          : "text-slate-700"
+                    }`}
+                  >
+                    {formatSAR(b.soe)}
+                  </td>
+                  <td className="px-4 py-2 font-mono text-slate-700">
+                    {formatSAR(b.reversals)}
+                  </td>
+                </tr>
+              ))}
+              {byBranch.length === 0 && (
+                <tr>
+                  <td
+                    colSpan={6}
+                    className="px-4 py-8 text-center text-slate-500"
+                  >
+                    لا توجد بيانات معتمدة في النطاق المحدّد.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+            {byBranch.length > 0 && (
+              <tfoot className="bg-slate-50 font-semibold">
+                <tr>
+                  <td className="px-4 py-2 text-slate-900">الإجمالي</td>
+                  <td className="px-4 py-2 text-slate-700">
+                    {filtered.length.toLocaleString("ar-SA")}
+                  </td>
+                  <td className="px-4 py-2 font-mono text-slate-900">
+                    {formatSAR(kpis.grossSales)}
+                  </td>
+                  <td className="px-4 py-2 font-mono text-slate-900">
+                    {formatSAR(kpis.cashActualHanded)}
+                  </td>
+                  <td className="px-4 py-2 font-mono text-slate-900">
+                    {formatSAR(kpis.shortageOrExcess)}
+                  </td>
+                  <td className="px-4 py-2 font-mono text-slate-900">
+                    {formatSAR(kpis.reversedTransactions)}
+                  </td>
+                </tr>
+              </tfoot>
+            )}
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// Tab 3 — Audit log
+// ============================================================================
+
+function AuditLogTab() {
+  const [logs, setLogs] = useState<DailyClosingAuditLog[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [closingIdFilter, setClosingIdFilter] = useState("");
+  const [actionFilter, setActionFilter] = useState<"all" | AuditAction>("all");
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const data = await listAuditLogs({
+        closingId: closingIdFilter.trim() || undefined,
+        action: actionFilter === "all" ? undefined : actionFilter,
+      });
+      setLogs(data);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "حدث خطأ غير متوقع.");
+    } finally {
+      setLoading(false);
+    }
+  }, [closingIdFilter, actionFilter]);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  return (
+    <div>
+      <div className="mb-4 flex flex-wrap items-center gap-2 rounded-md border border-slate-200 bg-white p-3">
+        <div className="relative">
+          <Search className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+          <input
+            type="text"
+            value={closingIdFilter}
+            onChange={(e) => setClosingIdFilter(e.target.value)}
+            placeholder="رقم الإقفال..."
+            className="w-64 rounded-md border border-slate-200 py-1.5 pr-9 pl-3 text-sm focus:border-slate-400 focus:outline-none"
+          />
+        </div>
+        <select
+          value={actionFilter}
+          onChange={(e) =>
+            setActionFilter(e.target.value as "all" | AuditAction)
+          }
+          className="rounded-md border border-slate-200 bg-white px-3 py-1.5 text-sm focus:border-slate-400 focus:outline-none"
+        >
+          <option value="all">كل الإجراءات</option>
+          {(Object.entries(ACTION_LABEL) as [AuditAction, string][]).map(
+            ([k, v]) => (
+              <option key={k} value={k}>
+                {v}
+              </option>
+            ),
+          )}
+        </select>
+        {(closingIdFilter || actionFilter !== "all") && (
+          <button
+            type="button"
+            onClick={() => {
+              setClosingIdFilter("");
+              setActionFilter("all");
+            }}
+            className="text-sm text-slate-500 hover:text-slate-700"
+          >
+            إعادة ضبط
+          </button>
+        )}
+      </div>
+
+      {loading && <Spinner label="جارٍ تحميل سجل التدقيق..." />}
+      {!loading && error && <ErrorBox message={error} />}
+      {!loading && !error && logs.length === 0 && (
+        <div className="rounded-md border border-slate-200 bg-white p-8 text-center text-slate-500">
+          لا توجد سجلات مطابقة.
+        </div>
+      )}
+
+      {!loading && !error && logs.length > 0 && (
+        <ol className="relative space-y-2 border-r-2 border-slate-200 pr-4">
+          {logs.map((log) => (
+            <li
+              key={log.id}
+              className="relative rounded-md border border-slate-200 bg-white p-3 shadow-sm"
+            >
+              <span className="absolute -right-[1.40rem] top-4 flex h-3 w-3 items-center justify-center rounded-full border-2 border-white bg-slate-300" />
+              <div className="flex items-start justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <ActionIcon action={log.action} />
+                  <span className="font-medium text-slate-900">
+                    {ACTION_LABEL[log.action]}
+                  </span>
+                </div>
+                <span className="text-xs text-slate-500">
+                  {formatDateTime(log.timestamp)}
+                </span>
+              </div>
+              <div className="mt-1 text-sm text-slate-600">
+                <span className="font-mono">{log.closingId}</span>
+                <span className="mx-1 text-slate-300">·</span>
+                <span>{ROLE_LABEL[log.actorRole]}</span>
+                {log.actorId && (
+                  <>
+                    <span className="mx-1 text-slate-300">·</span>
+                    <span className="text-slate-400">{log.actorId}</span>
+                  </>
+                )}
+              </div>
+              {log.comment && (
+                <div className="mt-2 rounded bg-slate-50 px-3 py-2 text-sm text-slate-700">
+                  {log.comment}
+                </div>
+              )}
+            </li>
+          ))}
+        </ol>
+      )}
+    </div>
+  );
+}
+===ENDFILE===
+
+===FILE: .env.local.example===
+# Copy to .env.local and fill with your Supabase project values.
+#   copy .env.local.example .env.local
+#
+# Dashboard: Project Settings → API
+
+NEXT_PUBLIC_SUPABASE_URL=https://YOUR_PROJECT_REF.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=your_anon_public_key_here
+
+# ---------------------------------------------------------------------------
+# GLM server-only credentials (used by /api/analyze-closing-image)
+# ---------------------------------------------------------------------------
+# Locally you can either:
+#   (a) put these in .sec only (gitignored, recommended), OR
+#   (b) uncomment them here in .env.local (gitignored).
+#
+# In production, set the SAME three values on Vercel → Project → Settings →
+# Environment Variables. NEVER prefix them with NEXT_PUBLIC_ — they must stay
+# server-side.
+#
+# GLM_API_KEY=your_glm_api_key_here
+# GLM_BASE_URL=https://api.z.ai/api/coding/paas/v4
+# GLM_VISION_MODEL=glm-4.6v
+
+# ---------------------------------------------------------------------------
+# M6 demo login credentials (demo v1 only — NOT secrets)
+# ---------------------------------------------------------------------------
+# Used by the login gateway (app/lib/auth.ts). These are placeholder demo
+# credentials for local testing; Supabase Auth replaces them in a later
+# milestone. When unset, the defaults shown here apply. Because they are
+# demo values (and appear in the client bundle), never put real secrets
+# in NEXT_PUBLIC_* variables.
+#
+# Finance / auditor tab (المراجعة المالية):
+# NEXT_PUBLIC_LOGIN_FINANCE_USER=finance
+# NEXT_PUBLIC_LOGIN_FINANCE_PASSWORD=finance
+#
+# IT / admin tab (مسؤول IT):
+# NEXT_PUBLIC_LOGIN_ADMIN_USER=admin
+# NEXT_PUBLIC_LOGIN_ADMIN_PASSWORD=admin
+===ENDFILE===
+
+===FILE: FOUNDATION.md===
+# FOUNDATION — luxuryprep
+
+بوابة الإغلاق المالي والمراجعة — علامة **luxuryprep** (واجهة عربية RTL، عملة الريال SAR).
+
+## Core decisions
+
+- **Brand:** luxuryprep — not "Pulse Cafe". All screens carry this brand.
+- **Stack:** Next.js (App Router) + TypeScript + Tailwind CSS.
+- **Data:** Supabase (Postgres + Storage) via lazy `getSupabase()` in `app/lib/supabase.ts`.
+- **AI extraction:** server-only GLM vision route `/api/analyze-closing-image`; keys never leave the server.
+- **No Firebase — ever.** No Firebase config modals, no Firebase imports, no connection settings buttons.
+- **Session (demo v1):** single source of truth in `localStorage` key `luxuryprep_session` (see `app/lib/auth.ts`). Roles: `cashier | manager | auditor | admin`. Cashier login also mirrors the branch lock to the legacy `cashier_selected_branch` key so M2–M4 wizard behavior keeps working. Supabase Auth replaces the demo credential checks in a later milestone.
+
+## Milestones
+
+- **M1** — Types, skeletons, Supabase client. Done.
+- **M2** — Cashier closing wizard with branch lock. Done.
+- **M3** — GLM vision extraction (Z-report → fields). Done.
+- **M4** — Auditor console: approvals, unified reports, audit log. Done.
+- **M5** — Hardening pass (localized parsing, aborts, offline queue). Done.
+- **M6 — Login gateway + demo session + IT shell. Done (2026-08-15).**
+  - `/` is now the login gateway: tabs «الفرع / الكاشير»، «المراجعة المالية»، «مسؤول IT» (emerald/slate card, RTL, luxuryprep branding).
+  - Cashier login = branch select validated against `public.branches` (typing an id like `B01` is allowed and validated against the same list) → `/cashier` with the branch locked (both session + legacy branch keys written).
+  - Finance login (demo `finance`/`finance`, overridable via `NEXT_PUBLIC_LOGIN_FINANCE_*`) → `/auditor`.
+  - IT login (demo `admin`/`admin`, overridable via `NEXT_PUBLIC_LOGIN_ADMIN_*`) → `/admin` (ready IT shell — no fake settings, no Firebase).
+  - Cashier & auditor pages are guarded via `requireRole(...)` with logout controls; the closing wizard and auditor tabs are otherwise untouched.
+===ENDFILE===
+
+END_M6

@@ -195,10 +195,11 @@ Verified against the live endpoint (`briefs/probe_glm_vision.js`, `briefs/probe_
 3. **M2** — Cashier 3-step + Storage uploads + duplicate-date guard + branch lock — **done** (R4 applied under user waiver A+B 2026-08-12; known Majors deferred)  
 4. **M3** — **GLM** `/api/analyze-closing-image` + confirmation UI — **done** (R5 applied under user waiver 2026-08-12; reviewers rate-limited)  
 5. **M4** — Auditor tabs (approvals, gated reports, audit log) — **done** (R1 applied under user waiver 2026-08-12; reviewers rate-limited)  
-6. **M5** — Documentation & cutover: `README.md`, `supabase/seed_branches.sql`, `supabase/CUTOVER.md`, `.env.local.example` GLM section, Vercel server env `GLM_API_KEY` / `GLM_BASE_URL` / `GLM_VISION_MODEL=glm-4.6v` — **done** (2026-08-12)
+6. **M5** — Documentation & cutover: `README.md`, `supabase/seed_branches.sql`, `supabase/CUTOVER.md`, `.env.local.example` GLM section, Vercel server env `GLM_API_KEY` / `GLM_BASE_URL` / `GLM_VISION_MODEL=glm-4.6v` — **done** (2026-08-12)  
+7. **M6** — Login gateway + demo session + IT shell — **done** (2026-08-15): `/` login (cashier branch / finance / IT), brand **luxuryprep**, Supabase branches only (no Firebase), `/admin` IT shell ready for later features
 
 All previous “Post-M3 still open” and “Post-M4 user action” items are closed as of M5 (2026-08-12). The only remaining open product item is point 3 above: real Foodics photo validation.
 
 ---
 
-`Foundation confirmed — M1–M5 complete. Remaining work is real-photo validation and (future) Supabase Auth roles.`
+`Foundation confirmed — M1–M6 complete. Remaining work is real-photo validation, IT panel features, and (future) Supabase Auth roles.`
