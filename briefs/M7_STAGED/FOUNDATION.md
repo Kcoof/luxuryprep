@@ -204,10 +204,10 @@ Verified against the live endpoint (`briefs/probe_glm_vision.js`, `briefs/probe_
 5. **M4** — Auditor tabs (approvals, gated reports, audit log) — **done** (R1 applied under user waiver 2026-08-12; reviewers rate-limited)  
 6. **M5** — Documentation & cutover: `README.md`, `supabase/seed_branches.sql`, `supabase/CUTOVER.md`, `.env.local.example` GLM section, Vercel server env `GLM_API_KEY` / `GLM_BASE_URL` / `GLM_VISION_MODEL=glm-4.6v` — **done** (2026-08-12)  
 7. **M6** — Login gateway + demo session + IT shell — **done** (2026-08-15): `/` login (cashier branch / finance / IT), brand **luxuryprep**, Supabase branches only (no Firebase), `/admin` IT shell ready for later features  
-8. **M7** — Cashier branch dashboard + bilingual AR/EN + `it_support_tickets` DB — **done** (2026-08-15): migration `006_it_support_tickets.sql`; `app/lib/i18n.ts` (default AR/RTL, `luxuryprep_locale`); `app/lib/tickets.ts`; cashier dashboard (`PreCloseChecklist` localStorage, demo `ItStatusWidget`, `ItTicketModal` → Supabase); bilingual login gateway; `/admin` ticket queue (filter + status + `admin_note`). Claude+Codex Approve on R4; applied from `briefs/M7_STAGED/`. **User must run `006` in Supabase SQL Editor.**
+8. **M7** — Cashier branch dashboard + bilingual AR/EN + `it_support_tickets` DB — **authored, in review (2026-08-15)**: migration `006_it_support_tickets.sql`; `app/lib/i18n.ts` (default AR/RTL, `luxuryprep_locale`); `app/lib/tickets.ts`; cashier dashboard (`PreCloseChecklist` localStorage, demo `ItStatusWidget`, `ItTicketModal` → Supabase); bilingual login gateway; `/admin` ticket queue (filter + status + `admin_note`). Round 2 completed the cashier/admin/login/FOUNDATION files after a round-1 length cutoff; wizard M2–M6 logic untouched.
 
-All previous “Post-M3 still open” and “Post-M4 user action” items are closed as of M5 (2026-08-12). Remaining open product items: real Foodics photo validation (point 3); run migration 006; (future) Supabase Auth roles; auditor bilingual (deferred).
+All previous “Post-M3 still open” and “Post-M4 user action” items are closed as of M5 (2026-08-12). Remaining open product items: real Foodics photo validation (point 3); M7 review + apply; (future) Supabase Auth roles.
 
 ---
 
-`Foundation confirmed — M1–M7 complete. Next: run SQL 006 in Supabase; real-photo validation; (future) Supabase Auth roles + auditor i18n.`
+`Foundation confirmed — M1–M6 complete; M7 authored (in review). Next: apply M7 review feedback, then real-photo validation and (future) Supabase Auth roles.`

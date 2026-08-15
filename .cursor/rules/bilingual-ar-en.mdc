@@ -1,0 +1,22 @@
+---
+description: System must support Arabic and English (bilingual UI + RTL/LTR)
+alwaysApply: true
+---
+
+# Bilingual: Arabic + English
+
+The **luxuryprep** Daily Financial Closing & POS Audit System must support **both Arabic and English**.
+
+## Rules
+
+- Every new user-facing screen, label, button, error, empty state, and modal must be bilingual (AR + EN). Do not ship Arabic-only or English-only UI for new work.
+- Default locale may remain Arabic for KSA operations; English must be switchable (persisted preference, e.g. `localStorage`).
+- When locale is Arabic: `dir="rtl"` and Arabic copy. When English: `dir="ltr"` and English copy.
+- Financial terms must have consistent AR/EN pairs (e.g. إجمالي المبيعات / Gross sales, عجز/زيادة / Shortage/Excess).
+- Prefer a small shared i18n dictionary (`app/lib/i18n` or similar) over hard-coded strings in components.
+- Database: store user-entered free text as submitted; UI chrome is translated. Branch names may stay as stored (often Arabic) unless a `name_en` column is added later.
+- Do not break existing Arabic RTL flows when adding English.
+
+## Scope reminder
+
+Incremental rollout is OK (login + cashier first, then auditor/admin), but **do not forget** bilingual when building any new feature.
