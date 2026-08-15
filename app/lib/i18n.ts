@@ -129,6 +129,10 @@ const DICTIONARY: Record<string, Entry> = {
 
   // -- cashier dashboard -------------------------------------------------
   "cashier.dashboard.title": { ar: "شاشة الفرع", en: "Branch Screen" },
+  "cashier.prep.title": {
+    ar: "تحضيرات ما قبل الإقفال",
+    en: "Pre-closing prep",
+  },
   "cashier.openTicket": { ar: "فتح تذكرة IT", en: "Open IT ticket" },
   "cashier.checklist.title": {
     ar: "قائمة التحقق قبل الإغلاق",
@@ -225,6 +229,10 @@ const DICTIONARY: Record<string, Entry> = {
   "wizard.title": {
     ar: "شاشة الكاشير — الإغلاق اليومي",
     en: "Cashier Screen — Daily Closing",
+  },
+  "wizard.steps.status": {
+    ar: "الخطوة {current} من {total}",
+    en: "Step {current} of {total}",
   },
   "wizard.step1.title": {
     ar: "الخطوة ١: اختيار الفرع والتاريخ",
