@@ -129,6 +129,32 @@ const DICTIONARY: Record<string, Entry> = {
 
   // -- cashier dashboard -------------------------------------------------
   "cashier.dashboard.title": { ar: "شاشة الفرع", en: "Branch Screen" },
+
+  "cashier.home.greetingMorning": { ar: "صباح الخير", en: "Good morning" },
+  "cashier.home.greetingAfternoon": { ar: "طاب يومك", en: "Good afternoon" },
+  "cashier.home.greetingEvening": { ar: "مساء الخير", en: "Good evening" },
+  "cashier.home.question": {
+    ar: "كيف حالة الأجهزة والأنظمة في فرعك اليوم؟",
+    en: "How are your devices and systems at your branch today?",
+  },
+  "cashier.home.card.checklist.title": {
+    ar: "قائمة ما قبل الإقفال",
+    en: "Pre-close checklist",
+  },
+  "cashier.home.card.it.title": { ar: "الدعم الفني", en: "IT support" },
+  "cashier.home.card.it.cta": {
+    ar: "فتح تذكرة دعم فني",
+    en: "Open an IT ticket",
+  },
+  "cashier.home.closing.title": {
+    ar: "الإقفال المالي اليومي",
+    en: "Daily financial closing",
+  },
+  "cashier.home.closing.subtitle": {
+    ar: "ابدأ خطوات الإقفال الثلاث وأرسل التقرير اليومي",
+    en: "Start the 3-step closing and submit today's report",
+  },
+  "cashier.home.closing.cta": { ar: "ابدأ الإقفال", en: "Start closing" },
   "cashier.prep.title": {
     ar: "تحضيرات ما قبل الإقفال",
     en: "Pre-closing prep",

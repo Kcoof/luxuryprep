@@ -134,12 +134,6 @@ const SECONDARY_ACTION_CLASS =
 const HEADER_ACTION_CLASS =
   "inline-flex min-h-11 items-center gap-1.5 rounded-lg border border-white/20 bg-white/10 px-3 text-xs font-semibold text-emerald-50 transition-colors hover:bg-white/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50 disabled:pointer-events-none disabled:opacity-50";
 
-// AI extraction is an assist (secondary to save), so it reads as an
-// emerald-outline action on a quiet slate card — no violet, no glow.
-// Restored after home restyle omitted this constant (build fix).
-const AI_BUTTON_CLASS =
-  "inline-flex min-h-11 w-full items-center justify-center gap-2 rounded-lg border border-emerald-600 bg-white px-4 py-2.5 text-sm font-semibold text-emerald-700 transition-colors hover:bg-emerald-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-600/40 disabled:pointer-events-none disabled:opacity-50";
-
 /**
  * B1: parse localized monetary input safely.
  *
