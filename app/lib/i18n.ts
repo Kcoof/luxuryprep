@@ -264,6 +264,49 @@ const DICTIONARY: Record<string, Entry> = {
     ar: "الخطوة ١: اختيار الفرع والتاريخ",
     en: "Step 1: Branch & Date",
   },
+
+  "wizard.step1.tip": {
+    ar: "نصيحة: ارفق تقرير Z من Foodics وصور إثباتات المدفوعات لتسريع المراجعة والتدقيق.",
+    en: "Tip: attach the Foodics Z-report and payment proof photos to speed up review and auditing.",
+  },
+  "wizard.step1.basicTitle": {
+    ar: "البيانات الأساسية للتقرير",
+    en: "Basic report data",
+  },
+  "wizard.step1.cashHanded": {
+    ar: "النقد المسلَّم فعليًا (ر.س) — اختياري",
+    en: "Actual cash handed (SAR) — optional",
+  },
+  "wizard.step1.zreportTitle": {
+    ar: "تقرير Z من Foodics",
+    en: "Foodics Z-report",
+  },
+  "wizard.step1.zreportDrop": {
+    ar: "اسحب صورة تقرير Z هنا أو اضغط للاختيار",
+    en: "Drop the Z-report photo here or tap to browse",
+  },
+  "wizard.step1.zreportHint": {
+    ar: "JPG / PNG / WEBP / HEIC",
+    en: "JPG / PNG / WEBP / HEIC",
+  },
+  "wizard.step1.attached": { ar: "تم الإرفاق", en: "Attached" },
+  "wizard.step1.replace": { ar: "استبدال", en: "Replace" },
+  "wizard.step1.proofsTitle": {
+    ar: "إثباتات المدفوعات",
+    en: "Payment proofs",
+  },
+  "wizard.step1.proofMada": { ar: "مدى", en: "Mada" },
+  "wizard.step1.proofCash": {
+    ar: "إيصال / قسيمة إيداع النقد",
+    en: "Cash deposit / receipt",
+  },
+  "wizard.step1.proofVisa": { ar: "فيزا", en: "Visa" },
+  "wizard.step1.optional": { ar: "اختياري", en: "Optional" },
+  "wizard.step1.addImage": { ar: "إضافة صورة", en: "Add image" },
+  "wizard.step1.cta": {
+    ar: "استخراج القيم والاستمرار إلى التأكيد",
+    en: "Extract & continue to confirmation",
+  },
   "wizard.step2.title": {
     ar: "الخطوة ٢: البيانات المالية",
     en: "Step 2: Financial Figures",
