@@ -39,7 +39,7 @@ const system =
   "Output ONLY ===FILE: path=== / ===ENDFILE=== full bodies. End END_UX_BATCH.";
 
 const payload = JSON.stringify({
-  model: process.env.GLM_MODEL || "GLM-5.2",
+  model: process.env.GLM_MODEL || "glm-5.3",
   messages: [
     { role: "system", content: system },
     {
@@ -50,7 +50,8 @@ const payload = JSON.stringify({
   ],
   temperature: 0.15,
   max_tokens: 64000,
-  thinking: { type: "disabled" },
+  thinking: { type: "enabled" },
+  reasoning_effort: process.env.GLM_REASONING_EFFORT || "low",
 });
 
 const url = new URL(

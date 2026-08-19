@@ -14,7 +14,7 @@ const page = fs.readFileSync(
   "utf8",
 );
 const payload = JSON.stringify({
-  model: process.env.GLM_MODEL || "GLM-5.2",
+  model: process.env.GLM_MODEL || "glm-5.3",
   messages: [
     {
       role: "system",
@@ -32,7 +32,8 @@ const payload = JSON.stringify({
   ],
   temperature: 0,
   max_tokens: 64000,
-  thinking: { type: "disabled" },
+  thinking: { type: "enabled" },
+  reasoning_effort: process.env.GLM_REASONING_EFFORT || "low",
 });
 const url = new URL(
   process.env.GLM_BASE_URL.replace(/\/$/, "") + "/chat/completions",

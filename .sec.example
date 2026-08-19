@@ -4,9 +4,12 @@
 # Coding Plan MUST use: https://api.z.ai/api/coding/paas/v4
 # General metered API:  https://api.z.ai/api/paas/v4
 
-# GLM_MODEL is text-only and rejects images (error 1210).
-# Z-report extraction must use GLM_VISION_MODEL.
+# GLM_MODEL is text/coding (authoring). GLM-5.3 API id is `glm-5.3`.
+# It rejects images (use GLM_VISION_MODEL for Z-reports).
+# Same GLM_API_KEY + Coding Plan base URL for 5.2 and 5.3.
+# GLM-5.3 requires thinking enabled + reasoning_effort (low|high|max).
 GLM_API_KEY=your_api_key_here
 GLM_BASE_URL=https://api.z.ai/api/coding/paas/v4
-GLM_MODEL=GLM-5.2
+GLM_MODEL=glm-5.3
 GLM_VISION_MODEL=glm-4.6v
+GLM_REASONING_EFFORT=low

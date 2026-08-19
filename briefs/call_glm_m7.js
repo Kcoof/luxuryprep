@@ -48,7 +48,7 @@ const system =
   "Finish with END_M7.";
 
 const payload = JSON.stringify({
-  model: process.env.GLM_MODEL || "GLM-5.2",
+  model: process.env.GLM_MODEL || "glm-5.3",
   messages: [
     { role: "system", content: system },
     {

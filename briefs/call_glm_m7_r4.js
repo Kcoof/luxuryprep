@@ -33,14 +33,15 @@ const system =
   "Output ONLY ===FILE: path=== / ===ENDFILE=== full bodies. End with END_M7.";
 
 const payload = JSON.stringify({
-  model: process.env.GLM_MODEL || "GLM-5.2",
+  model: process.env.GLM_MODEL || "glm-5.3",
   messages: [
     { role: "system", content: system },
     { role: "user", content: brief + "\n\n## Context\n" + context },
   ],
   temperature: 0.1,
   max_tokens: 64000,
-  thinking: { type: "disabled" },
+  thinking: { type: "enabled" },
+  reasoning_effort: process.env.GLM_REASONING_EFFORT || "low",
 });
 
 const url = new URL(

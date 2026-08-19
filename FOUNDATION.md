@@ -114,7 +114,7 @@ Core TypeScript contracts (implementation may use snake_case columns):
 - **No Gemini.** Image analysis uses **GLM** via Z.ai Coding Plan API.
 - Server endpoint: `POST /api/analyze-closing-image` (Next.js route).
 - Body: `{ imageBase64 }` (limit ~10mb).
-- Credentials: `GLM_API_KEY`, `GLM_BASE_URL=https://api.z.ai/api/coding/paas/v4`, `GLM_MODEL=GLM-5.2` (text-only authoring, not used by the vision route), **`GLM_VISION_MODEL=glm-4.6v`** (from `.sec` locally; mirrored as server env on Vercel — never `NEXT_PUBLIC_`).
+- Credentials: `GLM_API_KEY`, `GLM_BASE_URL=https://api.z.ai/api/coding/paas/v4`, **`GLM_MODEL=glm-5.3`** (text/coding authoring; same Coding Plan API key as before; not used by the vision route), **`GLM_VISION_MODEL=glm-4.6v`** (from `.sec` locally; mirrored as server env on Vercel — never `NEXT_PUBLIC_`). Authoring calls should send `thinking: { type: "enabled" }` and `reasoning_effort` (`low`|`high`|`max`).
 - Prompt task: expert POS Z-report reader; respond **ONLY** with raw JSON: `grossSales`, `netSales`, `cashSystem`, `spanSystem`, `deliveryAppsSystem`, `reversedTransactions`.
 
 ### Vision probe results (2026-08-12) — open point 1 resolved
