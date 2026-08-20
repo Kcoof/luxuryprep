@@ -1,10 +1,15 @@
 "use client";
 
 // M7 — cashier branch screen (luxuryprep, bilingual AR/EN).
-// Home restyle (Pulse-like layout, luxuryprep brand): full-bleed emerald
-// header with greeting + branch + date/time, a centered question, a 2×2
-// status-card grid (checklist progress / Foodics / Mada / IT ticket),
-// and a full-width primary daily-closing card that scrolls to the wizard.
+// MODE GATE: the page has two modes — "home" (default) and "closing".
+// Home shows the emerald header + question + 2×2 status grid + primary
+// daily-closing card; the wizard is NOT rendered. Clicking «ابدأ الإقفال»
+// switches mode to "closing" (no scroll-into-view). In closing mode the
+// home sections are hidden and the full wizard renders (step 1 first).
+// The wizard header carries a "Back to home" control; going back does
+// NOT reset form state (drafts/uploads survive an accidental back) —
+// reset only happens via the existing "start new closing" after success
+// or via the branch-change confirm.
 // The M2–M6 wizard logic (branch lock, duplicate guard, AI extraction
 // with abort/versioning, save/offline queue) is UNCHANGED — presentation
 // only.
@@ -32,10 +37,11 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
   AlertCircle,
+  ArrowLeft,
+  ArrowRight,
   Banknote,
   Calculator,
   Check,
-  ChevronDown,
   Clock,
   CreditCard,
   ImagePlus,
@@ -82,6 +88,9 @@ import {
 } from "./dashboard-sections";
 
 type Step = 1 | 2 | 3;
+
+/** View mode: "home" shows the dashboard; "closing" shows the wizard. */
+type ViewMode = "home" | "closing";
 
 const BRANCH_SESSION_KEY = "cashier_selected_branch";
 
@@ -141,6 +150,10 @@ const SECONDARY_ACTION_CLASS =
 // Light controls on the emerald header.
 const HEADER_ACTION_CLASS =
   "inline-flex min-h-11 items-center gap-1.5 rounded-lg border border-white/20 bg-white/10 px-3 text-xs font-semibold text-emerald-50 transition-colors hover:bg-white/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50 disabled:pointer-events-none disabled:opacity-50";
+
+// Back-to-home control in the wizard header row (light, quiet chrome).
+const BACK_HOME_CLASS =
+  "inline-flex min-h-11 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-600 transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-600/40 disabled:pointer-events-none disabled:opacity-50";
 
 // AI extraction is an assist (secondary to save), so it reads as an
 // emerald-outline action on a quiet slate card — no violet, no glow.
@@ -349,12 +362,12 @@ const PROOF_THEMES: Record<"mada" | "cash" | "visa", ProofSlotTheme> = {
   cash: {
     chip: "bg-amber-100 text-amber-700 ring-amber-600/20",
     border: "border-amber-200 hover:border-amber-400 hover:bg-amber-50/60",
-    ring: "focus-visible:ring-amber-600/40",
+    ring: "focus-visible:ring-emerald-600/40",
   },
   visa: {
     chip: "bg-sky-100 text-sky-700 ring-sky-600/20",
     border: "border-sky-200 hover:border-sky-400 hover:bg-sky-50/60",
-    ring: "focus-visible:ring-sky-600/40",
+    ring: "focus-visible:ring-emerald-600/40",
   },
 };
 
@@ -483,8 +496,25 @@ export default function CashierPage() {
   // M7: IT ticket modal state.
   const [ticketOpen, setTicketOpen] = useState(false);
 
-  // Scroll target for the primary daily-closing card CTA.
-  const wizardRef = useRef<HTMLDivElement>(null);
+  // ------------------------------------------------------------------
+  // View mode gate: "home" (dashboard) vs "closing" (wizard).
+  // Default home; the wizard is NOT rendered in home mode.
+  // ------------------------------------------------------------------
+  const [mode, setMode] = useState<ViewMode>("home");
+
+  // Opening the process from the primary card: dedicated handler that
+  // switches mode — no scroll-into-view, no state reset (step stays
+  // wherever the draft left it; a fresh start resets to step 1).
+  const handleStartClosing = useCallback(() => {
+    setMode("closing");
+  }, []);
+
+  // Going back home keeps in-progress drafts (uploads, fields, step) so
+  // an accidental back never loses work. Reset only happens through the
+  // existing "start new closing" (after step 3 success) or branch change.
+  const handleBackToHome = useCallback(() => {
+    setMode("home");
+  }, []);
 
   const [step, setStep] = useState<Step>(1);
   const [branches, setBranches] = useState<Branch[]>([]);
@@ -1134,9 +1164,8 @@ export default function CashierPage() {
     total: 3,
   });
 
-  const scrollToWizard = () => {
-    wizardRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
-  };
+  // Back arrow flips with direction (RTL points right, LTR points left).
+  const BackArrow = dir === "rtl" ? ArrowRight : ArrowLeft;
 
   return (
     <main className="min-h-screen bg-slate-50 pb-10" dir={dir}>
@@ -1144,6 +1173,8 @@ export default function CashierPage() {
           Home header — full-bleed emerald band (Pulse-like layout, still
           luxuryprep brand): time-of-day greeting, locked branch, live
           date/time chip, wordmark + Store icon, light logout controls.
+          Visible in BOTH modes (locale toggle + logout stay reachable
+          while closing).
          -------------------------------------------------------------- */}
       <header className="bg-emerald-800 px-4 pb-6 pt-5 text-white sm:px-6">
         <div className="mx-auto max-w-3xl">
@@ -1194,689 +1225,709 @@ export default function CashierPage() {
         </div>
       </header>
 
-      {/* Centered question + status card grid */}
       <div className="mx-auto max-w-3xl px-4 sm:px-6">
         <div className="-mt-3 translate-y-[-1.5rem] sm:-mt-4" />
-        <section className="pt-5">
-          <h2 className="text-center text-base font-bold text-slate-900 sm:text-lg">
-            {t(locale, "cashier.home.question")}
-          </h2>
 
-          <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
-            {/* Card A — pre-close checklist progress */}
-            {dashboardBranchId ? (
-              <PreCloseChecklistCard
-                locale={locale}
-                branchId={dashboardBranchId}
-                businessDate={businessDate}
-              />
-            ) : null}
+        {/* --------------------------------------------------------------
+            MODE A — home: question + status card grid + primary closing
+            card. The wizard is NOT rendered in this mode.
+           -------------------------------------------------------------- */}
+        {mode === "home" ? (
+          <>
+            <section className="pt-5">
+              <h2 className="text-center text-base font-bold text-slate-900 sm:text-lg">
+                {t(locale, "cashier.home.question")}
+              </h2>
 
-            {/* Card B — Foodics (demo status) */}
-            <ItStatusCard
-              locale={locale}
-              labelKey="cashier.itstatus.foodics"
-              state={demoItState("cashier.itstatus.foodics")}
-            />
+              <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
+                {/* Card A — pre-close checklist progress */}
+                {dashboardBranchId ? (
+                  <PreCloseChecklistCard
+                    locale={locale}
+                    branchId={dashboardBranchId}
+                    businessDate={businessDate}
+                  />
+                ) : null}
 
-            {/* Card C — Mada (demo status) */}
-            <ItStatusCard
-              locale={locale}
-              labelKey="cashier.itstatus.mada"
-              state={demoItState("cashier.itstatus.mada")}
-            />
+                {/* Card B — Foodics (demo status) */}
+                <ItStatusCard
+                  locale={locale}
+                  labelKey="cashier.itstatus.foodics"
+                  state={demoItState("cashier.itstatus.foodics")}
+                />
 
-            {/* Card D — IT ticket */}
+                {/* Card C — Mada (demo status) */}
+                <ItStatusCard
+                  locale={locale}
+                  labelKey="cashier.itstatus.mada"
+                  state={demoItState("cashier.itstatus.mada")}
+                />
+
+                {/* Card D — IT ticket */}
+                <button
+                  type="button"
+                  onClick={() => setTicketOpen(true)}
+                  disabled={!dashboardBranchId}
+                  className="card-frame flex min-h-[7.5rem] flex-col items-start gap-2 p-4 text-start transition-colors hover:bg-emerald-50/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-600/40 disabled:pointer-events-none disabled:opacity-50"
+                >
+                  <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-sky-100 text-sky-700 ring-1 ring-inset ring-sky-600/20">
+                    <LifeBuoy className="h-5 w-5" aria-hidden="true" />
+                  </span>
+                  <span className="text-sm font-semibold text-slate-900">
+                    {t(locale, "cashier.home.card.it.title")}
+                  </span>
+                  <span className="text-xs text-slate-500">
+                    {t(locale, "cashier.home.card.it.cta")}
+                  </span>
+                </button>
+              </div>
+            </section>
+
+            {/* ----------------------------------------------------------
+                Primary daily-closing card — opens the closing wizard
+                (mode switch, not a scroll target).
+               ---------------------------------------------------------- */}
             <button
               type="button"
-              onClick={() => setTicketOpen(true)}
-              disabled={!dashboardBranchId}
-              className="card-frame flex min-h-[7.5rem] flex-col items-start gap-2 p-4 text-start transition-colors hover:bg-emerald-50/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-600/40 disabled:pointer-events-none disabled:opacity-50"
+              onClick={handleStartClosing}
+              className="card-frame mt-4 flex w-full items-center gap-4 p-4 text-start transition-colors hover:bg-emerald-50/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-600/40"
             >
-              <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-sky-100 text-sky-700 ring-1 ring-inset ring-sky-600/20">
-                <LifeBuoy className="h-5 w-5" aria-hidden="true" />
+              <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-full bg-emerald-600 text-white shadow-sm">
+                <Calculator className="h-6 w-6" aria-hidden="true" />
               </span>
-              <span className="text-sm font-semibold text-slate-900">
-                {t(locale, "cashier.home.card.it.title")}
+              <span className="min-w-0 flex-1">
+                <span className="block text-sm font-bold text-slate-900 sm:text-base">
+                  {t(locale, "cashier.home.closing.title")}
+                </span>
+                <span className="mt-0.5 block text-xs text-slate-500 sm:text-sm">
+                  {t(locale, "cashier.home.closing.subtitle")}
+                </span>
               </span>
-              <span className="text-xs text-slate-500">
-                {t(locale, "cashier.home.card.it.cta")}
+              <span className="inline-flex min-h-11 shrink-0 items-center justify-center rounded-lg bg-emerald-600 px-4 text-sm font-semibold text-white transition-colors hover:bg-emerald-700">
+                {t(locale, "cashier.home.closing.cta")}
               </span>
             </button>
-          </div>
-        </section>
+          </>
+        ) : (
+          /* -----------------------------------------------------------
+              MODE B — closing: the full existing wizard (M2–M6).
+              Behavior unchanged; adds a back-to-home control in the
+              header row. Draft state is preserved when going back.
+             ----------------------------------------------------------- */
+          <div className="scroll-mt-4 pt-5">
+            <section className="card-frame overflow-hidden">
+              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 bg-slate-50/70 px-5 py-4 sm:px-6">
+                <div className="flex min-w-0 items-center gap-3">
+                  <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-emerald-600 text-white shadow-sm">
+                    <Calculator className="h-5 w-5" />
+                  </span>
+                  <h2 className="text-lg font-bold text-slate-900 sm:text-xl">
+                    {t(locale, "wizard.title")}
+                  </h2>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleBackToHome}
+                  className={BACK_HOME_CLASS}
+                >
+                  <BackArrow className="h-3.5 w-3.5" aria-hidden="true" />
+                  {t(locale, "wizard.backToHome")}
+                </button>
+              </div>
 
-        {/* ------------------------------------------------------------
-            Primary daily-closing card — scrolls to the wizard below.
-           ------------------------------------------------------------ */}
-        <button
-          type="button"
-          onClick={scrollToWizard}
-          className="card-frame mt-4 flex w-full items-center gap-4 p-4 text-start transition-colors hover:bg-emerald-50/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-600/40"
-        >
-          <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-full bg-emerald-600 text-white shadow-sm">
-            <Calculator className="h-6 w-6" aria-hidden="true" />
-          </span>
-          <span className="min-w-0 flex-1">
-            <span className="block text-sm font-bold text-slate-900 sm:text-base">
-              {t(locale, "cashier.home.closing.title")}
-            </span>
-            <span className="mt-0.5 block text-xs text-slate-500 sm:text-sm">
-              {t(locale, "cashier.home.closing.subtitle")}
-            </span>
-          </span>
-          <span className="inline-flex min-h-11 shrink-0 items-center justify-center rounded-lg bg-emerald-600 px-4 text-sm font-semibold text-white transition-colors hover:bg-emerald-700">
-            {t(locale, "cashier.home.closing.cta")}
-          </span>
-        </button>
-
-        {/* ------------------------------------------------------------
-            Closing wizard (M2–M6) — the PRIMARY job. Behavior unchanged.
-           ------------------------------------------------------------ */}
-        <div ref={wizardRef} className="scroll-mt-4 pt-5">
-          <section className="card-frame overflow-hidden">
-            <div className="flex items-center gap-3 border-b border-slate-100 bg-slate-50/70 px-5 py-4 sm:px-6">
-              <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-emerald-600 text-white shadow-sm">
-                <Calculator className="h-5 w-5" />
-              </span>
-              <h2 className="text-lg font-bold text-slate-900 sm:text-xl">
-                {t(locale, "wizard.title")}
-              </h2>
-            </div>
-
-            <div className="p-5 sm:p-6">
-              {/* Stepper — 44px chips, done steps get a check, connector
-                  fills as the cashier advances. R2: aria-label reuses the
-                  static wizard.title key (step count stays in the caption
-                  below) so screen readers get a stable landmark name. */}
-              <nav className="mb-6" aria-label={t(locale, "wizard.title")}>
-                <ol className="flex items-center gap-2 sm:gap-3">
-                  {([1, 2, 3] as const).map((s, i) => (
-                    <li
-                      key={s}
-                      className="flex flex-1 items-center gap-2 last:flex-none sm:gap-3"
-                    >
-                      <span
-                        aria-current={step === s ? "step" : undefined}
-                        className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-full text-sm font-bold ring-1 ring-inset ${
-                          step === s
-                            ? "bg-emerald-600 text-white ring-emerald-600 shadow-sm"
-                            : s < step
-                              ? "bg-emerald-100 text-emerald-700 ring-emerald-600/20"
-                              : "bg-slate-100 text-slate-400 ring-slate-200"
-                        }`}
+              <div className="p-5 sm:p-6">
+                {/* Stepper — 44px chips, done steps get a check, connector
+                    fills as the cashier advances. R2: aria-label reuses the
+                    static wizard.title key (step count stays in the caption
+                    below) so screen readers get a stable landmark name. */}
+                <nav className="mb-6" aria-label={t(locale, "wizard.title")}>
+                  <ol className="flex items-center gap-2 sm:gap-3">
+                    {([1, 2, 3] as const).map((s, i) => (
+                      <li
+                        key={s}
+                        className="flex flex-1 items-center gap-2 last:flex-none sm:gap-3"
                       >
-                        {s < step ? (
-                          <Check className="h-4 w-4" aria-hidden="true" />
-                        ) : (
-                          s
-                        )}
-                      </span>
-                      {i < 2 && (
                         <span
-                          aria-hidden="true"
-                          className={`h-1 flex-1 rounded-full transition-colors ${
-                            step > s ? "bg-emerald-500" : "bg-slate-200"
+                          aria-current={step === s ? "step" : undefined}
+                          className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-full text-sm font-bold ring-1 ring-inset ${
+                            step === s
+                              ? "bg-emerald-600 text-white ring-emerald-600 shadow-sm"
+                              : s < step
+                                ? "bg-emerald-100 text-emerald-700 ring-emerald-600/20"
+                                : "bg-slate-100 text-slate-400 ring-slate-200"
                           }`}
-                        />
-                      )}
-                    </li>
-                  ))}
-                </ol>
-                <p className="mt-2.5 text-center text-xs font-medium text-slate-500">
-                  {stepsStatusText}
-                </p>
-              </nav>
-
-              {/* Keyed wrapper replays the single step-change transition
-                  (.wizard-step-in, reduced-motion safe). All form state
-                  lives in this component, so the remount is safe. */}
-              <div key={step} className="wizard-step-in">
-                {/* Step 1 — Pulse-like restyle: green instruction banner,
-                    two columns on md+ (basic data | uploads), full-width
-                    analyze-and-continue CTA. */}
-                {step === 1 && (
-                  <div className="space-y-5">
-                    {/* Green instruction banner — short bilingual tip */}
-                    <div className="flex items-start gap-2.5 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm font-medium text-emerald-800">
-                      <Sparkles
-                        className="mt-0.5 h-4 w-4 shrink-0"
-                        aria-hidden="true"
-                      />
-                      <span>{t(locale, "wizard.step1.tip")}</span>
-                    </div>
-
-                    <div className="grid grid-cols-1 gap-6 md:grid-cols-2">
-                      {/* Col A — (1) Basic report data */}
-                      <div className="space-y-4">
-                        <h3 className="flex items-center gap-2 text-sm font-bold uppercase tracking-wide text-slate-500">
-                          <span className="flex h-7 w-7 items-center justify-center rounded-full bg-slate-100 text-sm font-bold text-slate-600">
-                            1
-                          </span>
-                          {t(locale, "wizard.step1.basicTitle")}
-                        </h3>
-
-                        {/* Branch (locked badge / picker) */}
-                        <div>
-                          <label
-                            htmlFor={
-                              isBranchLocked && selectedBranch
-                                ? undefined
-                                : "wizard-branch"
-                            }
-                            className="mb-1.5 block text-sm font-medium text-slate-700"
-                          >
-                            {t(locale, "common.branch")}
-                          </label>
-                          {branchesLoading ? (
-                            <div className="flex min-h-11 items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3.5 text-sm text-slate-500">
-                              <Loader2 className="h-4 w-4 animate-spin" />
-                              {t(locale, "common.branchesLoading")}
-                            </div>
-                          ) : branchesError ? (
-                            <div className="flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">
-                              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-                              <span>{t(locale, "wizard.branchesError")}</span>
-                            </div>
-                          ) : !isBranchLocked ? (
-                            <select
-                              id="wizard-branch"
-                              className={INPUT_CLASS}
-                              value={selectedBranch?.id ?? ""}
-                              onChange={(e) => {
-                                const b = branches.find(
-                                  (x) => x.id === e.target.value,
-                                );
-                                if (b) handlePickBranch(b);
-                              }}
-                            >
-                              <option value="">
-                                {t(locale, "common.branchPlaceholder")}
-                              </option>
-                              {branches.map((b) => (
-                                <option key={b.id} value={b.id}>
-                                  {b.id} — {b.name}
-                                </option>
-                              ))}
-                            </select>
+                        >
+                          {s < step ? (
+                            <Check className="h-4 w-4" aria-hidden="true" />
                           ) : (
-                            <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-emerald-200 bg-emerald-50/60 px-3.5 py-2.5">
-                              <span className="flex items-center gap-2 text-sm font-medium text-slate-800">
-                                <Lock className="h-4 w-4 shrink-0 text-emerald-600" />
-                                {selectedBranch?.id} — {selectedBranch?.name}
-                              </span>
-                              <button
-                                type="button"
-                                onClick={handleConfirmBranchChange}
-                                className="inline-flex min-h-9 items-center rounded-md px-2 text-xs font-semibold text-emerald-700 transition-colors hover:bg-emerald-100 hover:text-emerald-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-600/40"
-                              >
-                                {t(locale, "wizard.branch.change")}
-                              </button>
-                            </div>
+                            s
                           )}
-                        </div>
-
-                        {/* Business date */}
-                        <div>
-                          <label
-                            htmlFor="wizard-date"
-                            className="mb-1.5 block text-sm font-medium text-slate-700"
-                          >
-                            {t(locale, "wizard.date")}
-                          </label>
-                          <input
-                            id="wizard-date"
-                            type="date"
-                            className={INPUT_CLASS}
-                            value={businessDate}
-                            onChange={(e) => setBusinessDate(e.target.value)}
+                        </span>
+                        {i < 2 && (
+                          <span
+                            aria-hidden="true"
+                            className={`h-1 flex-1 rounded-full transition-colors ${
+                              step > s ? "bg-emerald-500" : "bg-slate-200"
+                            }`}
                           />
-                        </div>
+                        )}
+                      </li>
+                    ))}
+                  </ol>
+                  <p className="mt-2.5 text-center text-xs font-medium text-slate-500">
+                    {stepsStatusText}
+                  </p>
+                </nav>
 
-                        {/* Optional actual cash handed (SAR) — same
-                            rawValues buffer step 2 uses; optional here. */}
-                        <NumberInput
-                          locale={locale}
-                          id="field-cashActualHanded-step1"
-                          label={t(locale, "wizard.step1.cashHanded")}
-                          value={rawValues.cashActualHanded}
-                          onChange={(v) =>
-                            handleFieldChange("cashActualHanded", v)
-                          }
-                          badge={badgeFor("cashActualHanded")}
-                          error={parseErrors.has("cashActualHanded")}
-                        />
-                      </div>
-
-                      {/* Col B — uploads */}
-                      <div className="space-y-4">
-                        {/* (2) Foodics Z-report — large dashed dropzone */}
-                        <div>
+                {/* Keyed wrapper replays the single step-change transition
+                    (.wizard-step-in, reduced-motion safe). All form state
+                    lives in this component, so the remount is safe. */}
+                <div key={step} className="wizard-step-in">
+                  {/* Step 1 — Pulse-like restyle: green instruction banner,
+                      two columns on md+ (basic data | uploads), full-width
+                      analyze-and-continue CTA. */}
+                  {step === 1 && (
+                    <div className="space-y-5">
+                      <div className="grid grid-cols-1 gap-6 md:grid-cols-2">
+                        {/* Col A — (1) Basic report data */}
+                        <div className="space-y-4">
                           <h3 className="flex items-center gap-2 text-sm font-bold uppercase tracking-wide text-slate-500">
                             <span className="flex h-7 w-7 items-center justify-center rounded-full bg-slate-100 text-sm font-bold text-slate-600">
-                              2
+                              1
                             </span>
-                            {t(locale, "wizard.step1.zreportTitle")}
+                            {t(locale, "wizard.step1.basicTitle")}
                           </h3>
-                          <label
-                            htmlFor="wizard-zreport"
-                            className="mt-2 flex cursor-pointer flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed border-emerald-300 bg-emerald-50/40 px-4 py-7 text-center transition-colors hover:border-emerald-500 hover:bg-emerald-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-600/40"
-                          >
-                            <span className="flex h-11 w-11 items-center justify-center rounded-full bg-emerald-100 text-emerald-700">
-                              <ImagePlus
-                                className="h-5 w-5"
-                                aria-hidden="true"
-                              />
-                            </span>
-                            <span className="text-sm font-semibold text-slate-800">
-                              {t(locale, "wizard.step1.zreportDrop")}
-                            </span>
-                            <span className="text-xs text-slate-500">
-                              {t(locale, "wizard.step1.zreportHint")}
-                            </span>
-                          </label>
-                          <input
-                            id="wizard-zreport"
-                            type="file"
-                            accept={ACCEPTED_IMAGE_TYPES}
-                            className="sr-only"
-                            onChange={(e) => {
-                              onZReport(e.target.files?.[0]);
-                              e.target.value = "";
-                            }}
-                          />
-                          {zReportImage && (
-                            <div className="mt-2.5 rounded-xl border border-slate-200 p-2">
-                              {/* eslint-disable-next-line @next/next/no-img-element */}
-                              <img
-                                src={zReportImage}
-                                alt={t(locale, "wizard.zreport")}
-                                className="max-h-44 w-full rounded-lg object-contain"
-                              />
-                              <div className="mt-2 flex items-center justify-between gap-2">
-                                <span className="flex items-center gap-1.5 text-xs font-medium text-emerald-700">
-                                  <Check
-                                    className="h-3.5 w-3.5"
-                                    aria-hidden="true"
-                                  />
-                                  {t(locale, "wizard.step1.attached")}
+
+                          {/* Branch (locked badge / picker) */}
+                          <div>
+                            <label
+                              htmlFor={
+                                isBranchLocked && selectedBranch
+                                  ? undefined
+                                  : "wizard-branch"
+                              }
+                              className="mb-1.5 block text-sm font-medium text-slate-700"
+                            >
+                              {t(locale, "common.branch")}
+                            </label>
+                            {branchesLoading ? (
+                              <div className="flex min-h-11 items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3.5 text-sm text-slate-500">
+                                <Loader2 className="h-4 w-4 animate-spin" />
+                                {t(locale, "common.branchesLoading")}
+                              </div>
+                            ) : branchesError ? (
+                              <div className="flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">
+                                <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+                                <span>{t(locale, "wizard.branchesError")}</span>
+                              </div>
+                            ) : !isBranchLocked ? (
+                              <select
+                                id="wizard-branch"
+                                className={INPUT_CLASS}
+                                value={selectedBranch?.id ?? ""}
+                                onChange={(e) => {
+                                  const b = branches.find(
+                                    (x) => x.id === e.target.value,
+                                  );
+                                  if (b) handlePickBranch(b);
+                                }}
+                              >
+                                <option value="">
+                                  {t(locale, "common.branchPlaceholder")}
+                                </option>
+                                {branches.map((b) => (
+                                  <option key={b.id} value={b.id}>
+                                    {b.id} — {b.name}
+                                  </option>
+                                ))}
+                              </select>
+                            ) : (
+                              <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-emerald-200 bg-emerald-50/60 px-3.5 py-2.5">
+                                <span className="flex items-center gap-2 text-sm font-medium text-slate-800">
+                                  <Lock className="h-4 w-4 shrink-0 text-emerald-600" />
+                                  {selectedBranch?.id} — {selectedBranch?.name}
                                 </span>
                                 <button
                                   type="button"
-                                  onClick={() => setZReportImage(null)}
-                                  className="inline-flex min-h-9 items-center gap-1.5 rounded-md px-2 text-xs font-semibold text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-600/40"
+                                  onClick={handleConfirmBranchChange}
+                                  className="inline-flex min-h-9 items-center rounded-md px-2 text-xs font-semibold text-emerald-700 transition-colors hover:bg-emerald-100 hover:text-emerald-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-600/40"
                                 >
-                                  <RotateCcw
-                                    className="h-3.5 w-3.5"
-                                    aria-hidden="true"
-                                  />
-                                  {t(locale, "wizard.step1.replace")}
+                                  {t(locale, "wizard.branch.change")}
                                 </button>
                               </div>
-                            </div>
-                          )}
+                            )}
+                          </div>
+
+                          {/* Business date */}
+                          <div>
+                            <label
+                              htmlFor="wizard-date"
+                              className="mb-1.5 block text-sm font-medium text-slate-700"
+                            >
+                              {t(locale, "wizard.date")}
+                            </label>
+                            <input
+                              id="wizard-date"
+                              type="date"
+                              className={INPUT_CLASS}
+                              value={businessDate}
+                              onChange={(e) => setBusinessDate(e.target.value)}
+                            />
+                          </div>
+
+                          {/* Optional actual cash handed (SAR) — same
+                              rawValues buffer step 2 uses; optional here. */}
+                          <NumberInput
+                            locale={locale}
+                            id="field-cashActualHanded-step1"
+                            label={t(locale, "wizard.step1.cashHanded")}
+                            value={rawValues.cashActualHanded}
+                            onChange={(v) =>
+                              handleFieldChange("cashActualHanded", v)
+                            }
+                            badge={badgeFor("cashActualHanded")}
+                            error={parseErrors.has("cashActualHanded")}
+                          />
                         </div>
 
-                        {/* (3) Payment proofs — three separate optional
-                            slots: Mada / Cash / Visa, one image each. */}
-                        <div>
-                          <h3 className="flex items-center gap-2 text-sm font-bold uppercase tracking-wide text-slate-500">
-                            <span className="flex h-7 w-7 items-center justify-center rounded-full bg-slate-100 text-sm font-bold text-slate-600">
-                              3
-                            </span>
-                            {t(locale, "wizard.step1.proofsTitle")}
-                          </h3>
-                          <div className="mt-2 space-y-3">
-                            <ProofSlot
-                              locale={locale}
-                              slot="mada"
-                              label={t(locale, "wizard.step1.proofMada")}
-                              image={madaProof}
-                              onPick={(f) => onProofSlot(f, setMadaProof)}
-                              onClear={() => setMadaProof(null)}
+                        {/* Col B — uploads */}
+                        <div className="space-y-4">
+                          {/* (2) Foodics Z-report — large dashed dropzone */}
+                          <div>
+                            <h3 className="flex items-center gap-2 text-sm font-bold uppercase tracking-wide text-slate-500">
+                              <span className="flex h-7 w-7 items-center justify-center rounded-full bg-slate-100 text-sm font-bold text-slate-600">
+                                2
+                              </span>
+                              {t(locale, "wizard.step1.zreportTitle")}
+                            </h3>
+                            <label
+                              htmlFor="wizard-zreport"
+                              className="mt-2 flex cursor-pointer flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed border-emerald-300 bg-emerald-50/40 px-4 py-7 text-center transition-colors hover:border-emerald-500 hover:bg-emerald-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-600/40"
+                            >
+                              <span className="flex h-11 w-11 items-center justify-center rounded-full bg-emerald-100 text-emerald-700">
+                                <ImagePlus
+                                  className="h-5 w-5"
+                                  aria-hidden="true"
+                                />
+                              </span>
+                              <span className="text-sm font-semibold text-slate-800">
+                                {t(locale, "wizard.step1.zreportDrop")}
+                              </span>
+                              <span className="text-xs text-slate-500">
+                                {t(locale, "wizard.step1.zreportHint")}
+                              </span>
+                            </label>
+                            <input
+                              id="wizard-zreport"
+                              type="file"
+                              accept={ACCEPTED_IMAGE_TYPES}
+                              className="sr-only"
+                              onChange={(e) => {
+                                onZReport(e.target.files?.[0]);
+                                e.target.value = "";
+                              }}
                             />
-                            <ProofSlot
-                              locale={locale}
-                              slot="cash"
-                              label={t(locale, "wizard.step1.proofCash")}
-                              image={cashProof}
-                              onPick={(f) => onProofSlot(f, setCashProof)}
-                              onClear={() => setCashProof(null)}
-                            />
-                            <ProofSlot
-                              locale={locale}
-                              slot="visa"
-                              label={t(locale, "wizard.step1.proofVisa")}
-                              image={visaProof}
-                              onPick={(f) => onProofSlot(f, setVisaProof)}
-                              onClear={() => setVisaProof(null)}
-                            />
+                            {zReportImage && (
+                              <div className="mt-2.5 rounded-xl border border-slate-200 p-2">
+                                {/* eslint-disable-next-line @next/next/no-img-element */}
+                                <img
+                                  src={zReportImage}
+                                  alt={t(locale, "wizard.zreport")}
+                                  className="max-h-44 w-full rounded-lg object-contain"
+                                />
+                                <div className="mt-2 flex items-center justify-between gap-2">
+                                  <span className="flex items-center gap-1.5 text-xs font-medium text-emerald-700">
+                                    <Check
+                                      className="h-3.5 w-3.5"
+                                      aria-hidden="true"
+                                    />
+                                    {t(locale, "wizard.step1.attached")}
+                                  </span>
+                                  <button
+                                    type="button"
+                                    onClick={() => setZReportImage(null)}
+                                    className="inline-flex min-h-9 items-center gap-1.5 rounded-md px-2 text-xs font-semibold text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-600/40"
+                                  >
+                                    <RotateCcw
+                                      className="h-3.5 w-3.5"
+                                      aria-hidden="true"
+                                    />
+                                    {t(locale, "wizard.step1.replace")}
+                                  </button>
+                                </div>
+                              </div>
+                            )}
+                          </div>
+
+                          {/* (3) Payment proofs — three separate optional
+                              slots: Mada / Cash / Visa, one image each. */}
+                          <div>
+                            <h3 className="flex items-center gap-2 text-sm font-bold uppercase tracking-wide text-slate-500">
+                              <span className="flex h-7 w-7 items-center justify-center rounded-full bg-slate-100 text-sm font-bold text-slate-600">
+                                3
+                              </span>
+                              {t(locale, "wizard.step1.proofsTitle")}
+                            </h3>
+                            <div className="mt-2 space-y-3">
+                              <ProofSlot
+                                locale={locale}
+                                slot="mada"
+                                label={t(locale, "wizard.step1.proofMada")}
+                                image={madaProof}
+                                onPick={(f) => onProofSlot(f, setMadaProof)}
+                                onClear={() => setMadaProof(null)}
+                              />
+                              <ProofSlot
+                                locale={locale}
+                                slot="cash"
+                                label={t(locale, "wizard.step1.proofCash")}
+                                image={cashProof}
+                                onPick={(f) => onProofSlot(f, setCashProof)}
+                                onClear={() => setCashProof(null)}
+                              />
+                              <ProofSlot
+                                locale={locale}
+                                slot="visa"
+                                label={t(locale, "wizard.step1.proofVisa")}
+                                image={visaProof}
+                                onPick={(f) => onProofSlot(f, setVisaProof)}
+                                onClear={() => setVisaProof(null)}
+                              />
+                            </div>
                           </div>
                         </div>
                       </div>
-                    </div>
 
-                    {/* Full-width CTA — advance to confirmation (analyze
-                        stays on step 2, existing behavior unchanged). */}
-                    <button
-                      type="button"
-                      className={`${PRIMARY_ACTION_CLASS} w-full`}
-                      disabled={!selectedBranch || !businessDate}
-                      onClick={() => setStep(2)}
-                    >
-                      <Sparkles className="h-4 w-4" aria-hidden="true" />
-                      {t(locale, "wizard.step1.cta")}
-                    </button>
-                  </div>
-                )}
-
-                {/* Step 2 */}
-                {step === 2 && (
-                  <div className="space-y-4">
-                    <h3 className="text-lg font-semibold text-slate-900">
-                      {t(locale, "wizard.step2.title")}
-                    </h3>
-
-                    {/* M3: AI analysis panel — assistive, emerald-accented */}
-                    <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-4">
-                      <div className="flex items-start gap-3">
-                        <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-emerald-100 text-emerald-700">
-                          <Sparkles className="h-4 w-4" />
-                        </span>
-                        <div className="min-w-0">
-                          <p className="text-sm font-semibold text-slate-900">
-                            {t(locale, "wizard.ai.title")}
-                          </p>
-                          <p className="mt-0.5 text-xs leading-5 text-slate-500">
-                            {t(locale, "wizard.ai.desc")}
-                          </p>
-                        </div>
-                      </div>
+                      {/* Full-width CTA — advance to confirmation (analyze
+                          stays on step 2, existing behavior unchanged). */}
                       <button
                         type="button"
-                        onClick={handleAnalyzeImage}
-                        disabled={!zReportImage || aiAnalyzing}
-                        className={`${AI_BUTTON_CLASS} mt-3`}
+                        className={`${PRIMARY_ACTION_CLASS} w-full`}
+                        disabled={!selectedBranch || !businessDate}
+                        onClick={() => setStep(2)}
                       >
-                        {aiAnalyzing ? (
-                          <>
-                            <Loader2 className="h-4 w-4 animate-spin" />
-                            {t(locale, "wizard.ai.analyzing")}
-                          </>
-                        ) : (
-                          <>
-                            <Sparkles className="h-4 w-4" />
-                            {t(locale, "wizard.ai.analyze")}
-                          </>
-                        )}
+                        <Sparkles className="h-4 w-4" aria-hidden="true" />
+                        {t(locale, "wizard.step1.cta")}
                       </button>
-                      {!zReportImage && (
-                        <p className="mt-2 text-xs text-slate-500">
-                          {t(locale, "wizard.ai.noImage")}
-                        </p>
-                      )}
-                      {/* A1: tone by outcome. "empty" (nothing extracted) is
-                          an amber attention notice — emerald + Check is
-                          reserved for the filled > 0 success notice. */}
-                      {aiNotice &&
-                        (aiNoticeKind === "empty" ? (
-                          <div className="mt-2 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-2 text-xs font-medium text-amber-800">
-                            <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                            <span>{aiNotice}</span>
-                          </div>
-                        ) : (
-                          <div className="mt-2 flex items-start gap-2 rounded-lg bg-emerald-50 p-2 text-xs font-medium text-emerald-800">
-                            <Check className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                            <span>{aiNotice}</span>
-                          </div>
-                        ))}
-                      {aiError && (
-                        <div className="mt-2 flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50 p-2 text-xs text-rose-700">
-                          <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                          <span>{aiError}</span>
-                        </div>
-                      )}
                     </div>
+                  )}
 
-                    <NumberInput
-                      locale={locale}
-                      id="field-grossSales"
-                      label={t(locale, "wizard.field.grossSales")}
-                      value={rawValues.grossSales}
-                      onChange={(v) => handleFieldChange("grossSales", v)}
-                      badge={badgeFor("grossSales")}
-                      error={parseErrors.has("grossSales")}
-                    />
-                    <NumberInput
-                      locale={locale}
-                      id="field-netSales"
-                      label={t(locale, "wizard.field.netSales")}
-                      value={rawValues.netSales}
-                      onChange={(v) => handleFieldChange("netSales", v)}
-                      badge={badgeFor("netSales")}
-                      error={parseErrors.has("netSales")}
-                    />
-                    <NumberInput
-                      locale={locale}
-                      id="field-cashSystem"
-                      label={t(locale, "wizard.field.cashSystem")}
-                      value={rawValues.cashSystem}
-                      onChange={(v) => handleFieldChange("cashSystem", v)}
-                      badge={badgeFor("cashSystem")}
-                      error={parseErrors.has("cashSystem")}
-                    />
-                    {/* O1: Manual actual cash uses the same rawValues.cashActualHanded
-                        buffer as the non-manual path. useManualCash controls only the
-                        label and whether manual_actual_cash is persisted on save. */}
-                    <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3.5">
-                      <label className="flex min-h-11 cursor-pointer items-center gap-2.5 text-sm font-medium text-slate-700">
-                        <input
-                          type="checkbox"
-                          checked={useManualCash}
-                          onChange={(e) => setUseManualCash(e.target.checked)}
-                          className="h-5 w-5 shrink-0 accent-emerald-600"
-                        />
-                        {t(locale, "wizard.manualCash")}
-                      </label>
-                      <div className="mt-1">
-                        {useManualCash ? (
-                          <NumberInput
-                            locale={locale}
-                            id="field-cashActualHanded"
-                            label={t(locale, "wizard.field.actualCash")}
-                            value={rawValues.cashActualHanded}
-                            onChange={(v) =>
-                              handleFieldChange("cashActualHanded", v)
-                            }
-                            badge={badgeFor("cashActualHanded")}
-                            error={parseErrors.has("cashActualHanded")}
-                          />
-                        ) : (
-                          <NumberInput
-                            locale={locale}
-                            id="field-cashActualHanded"
-                            label={t(locale, "wizard.field.cashHanded")}
-                            value={rawValues.cashActualHanded}
-                            onChange={(v) =>
-                              handleFieldChange("cashActualHanded", v)
-                            }
-                            badge={badgeFor("cashActualHanded")}
-                            error={parseErrors.has("cashActualHanded")}
-                          />
+                  {/* Step 2 */}
+                  {step === 2 && (
+                    <div className="space-y-4">
+                      <h3 className="text-lg font-semibold text-slate-900">
+                        {t(locale, "wizard.step2.title")}
+                      </h3>
+
+                      {/* M3: AI analysis panel — assistive, emerald-accented */}
+                      <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-4">
+                        <div className="flex items-start gap-3">
+                          <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-emerald-100 text-emerald-700">
+                            <Sparkles className="h-4 w-4" />
+                          </span>
+                          <div className="min-w-0">
+                            <p className="text-sm font-semibold text-slate-900">
+                              {t(locale, "wizard.ai.title")}
+                            </p>
+                            <p className="mt-0.5 text-xs leading-5 text-slate-500">
+                              {t(locale, "wizard.ai.desc")}
+                            </p>
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={handleAnalyzeImage}
+                          disabled={!zReportImage || aiAnalyzing}
+                          className={`${AI_BUTTON_CLASS} mt-3`}
+                        >
+                          {aiAnalyzing ? (
+                            <>
+                              <Loader2 className="h-4 w-4 animate-spin" />
+                              {t(locale, "wizard.ai.analyzing")}
+                            </>
+                          ) : (
+                            <>
+                              <Sparkles className="h-4 w-4" />
+                              {t(locale, "wizard.ai.analyze")}
+                            </>
+                          )}
+                        </button>
+                        {!zReportImage && (
+                          <p className="mt-2 text-xs text-slate-500">
+                            {t(locale, "wizard.ai.noImage")}
+                          </p>
+                        )}
+                        {/* A1: tone by outcome. "empty" (nothing extracted) is
+                            an amber attention notice — emerald + Check is
+                            reserved for the filled > 0 success notice. */}
+                        {aiNotice &&
+                          (aiNoticeKind === "empty" ? (
+                            <div className="mt-2 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-2 text-xs font-medium text-amber-800">
+                              <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                              <span>{aiNotice}</span>
+                            </div>
+                          ) : (
+                            <div className="mt-2 flex items-start gap-2 rounded-lg bg-emerald-50 p-2 text-xs font-medium text-emerald-800">
+                              <Check className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                              <span>{aiNotice}</span>
+                            </div>
+                          ))}
+                        {aiError && (
+                          <div className="mt-2 flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50 p-2 text-xs text-rose-700">
+                            <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                            <span>{aiError}</span>
+                          </div>
                         )}
                       </div>
-                    </div>
-                    <NumberInput
-                      locale={locale}
-                      id="field-spanSystem"
-                      label={t(locale, "wizard.field.span")}
-                      value={rawValues.spanSystem}
-                      onChange={(v) => handleFieldChange("spanSystem", v)}
-                      badge={badgeFor("spanSystem")}
-                      error={parseErrors.has("spanSystem")}
-                    />
-                    <NumberInput
-                      locale={locale}
-                      id="field-deliveryAppsSystem"
-                      label={t(locale, "wizard.field.deliveryApps")}
-                      value={rawValues.deliveryAppsSystem}
-                      onChange={(v) => handleFieldChange("deliveryAppsSystem", v)}
-                      badge={badgeFor("deliveryAppsSystem")}
-                      error={parseErrors.has("deliveryAppsSystem")}
-                    />
-                    <NumberInput
-                      locale={locale}
-                      id="field-reversedTransactions"
-                      label={t(locale, "wizard.field.reversals")}
-                      value={rawValues.reversedTransactions}
-                      onChange={(v) => handleFieldChange("reversedTransactions", v)}
-                      badge={badgeFor("reversedTransactions")}
-                      error={parseErrors.has("reversedTransactions")}
-                    />
-                    {/* Shortage/excess — high-contrast, impossible to miss:
-                        rose shortage / emerald excess / slate balanced. */}
-                    <div
-                      className={`rounded-xl border p-4 ${
-                        soeTone === "shortage"
-                          ? "border-rose-200 bg-rose-50"
-                          : soeTone === "excess"
-                            ? "border-emerald-200 bg-emerald-50"
-                            : "border-slate-200 bg-slate-50"
-                      }`}
-                    >
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <span className="flex items-center gap-2 text-sm font-semibold text-slate-700">
-                          {soeTone === "shortage" ? (
-                            <TrendingDown
-                              className="h-4 w-4 shrink-0 text-rose-600"
-                              aria-hidden="true"
-                            />
-                          ) : soeTone === "excess" ? (
-                            <TrendingUp
-                              className="h-4 w-4 shrink-0 text-emerald-600"
-                              aria-hidden="true"
+
+                      <NumberInput
+                        locale={locale}
+                        id="field-grossSales"
+                        label={t(locale, "wizard.field.grossSales")}
+                        value={rawValues.grossSales}
+                        onChange={(v) => handleFieldChange("grossSales", v)}
+                        badge={badgeFor("grossSales")}
+                        error={parseErrors.has("grossSales")}
+                      />
+                      <NumberInput
+                        locale={locale}
+                        id="field-netSales"
+                        label={t(locale, "wizard.field.netSales")}
+                        value={rawValues.netSales}
+                        onChange={(v) => handleFieldChange("netSales", v)}
+                        badge={badgeFor("netSales")}
+                        error={parseErrors.has("netSales")}
+                      />
+                      <NumberInput
+                        locale={locale}
+                        id="field-cashSystem"
+                        label={t(locale, "wizard.field.cashSystem")}
+                        value={rawValues.cashSystem}
+                        onChange={(v) => handleFieldChange("cashSystem", v)}
+                        badge={badgeFor("cashSystem")}
+                        error={parseErrors.has("cashSystem")}
+                      />
+                      {/* O1: Manual actual cash uses the same rawValues.cashActualHanded
+                          buffer as the non-manual path. useManualCash controls only the
+                          label and whether manual_actual_cash is persisted on save. */}
+                      <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3.5">
+                        <label className="flex min-h-11 cursor-pointer items-center gap-2.5 text-sm font-medium text-slate-700">
+                          <input
+                            type="checkbox"
+                            checked={useManualCash}
+                            onChange={(e) => setUseManualCash(e.target.checked)}
+                            className="h-5 w-5 shrink-0 accent-emerald-600"
+                          />
+                          {t(locale, "wizard.manualCash")}
+                        </label>
+                        <div className="mt-1">
+                          {useManualCash ? (
+                            <NumberInput
+                              locale={locale}
+                              id="field-cashActualHanded"
+                              label={t(locale, "wizard.field.actualCash")}
+                              value={rawValues.cashActualHanded}
+                              onChange={(v) =>
+                                handleFieldChange("cashActualHanded", v)
+                              }
+                              badge={badgeFor("cashActualHanded")}
+                              error={parseErrors.has("cashActualHanded")}
                             />
                           ) : (
-                            <Minus
-                              className="h-4 w-4 shrink-0 text-slate-400"
-                              aria-hidden="true"
+                            <NumberInput
+                              locale={locale}
+                              id="field-cashActualHanded"
+                              label={t(locale, "wizard.field.cashHanded")}
+                              value={rawValues.cashActualHanded}
+                              onChange={(v) =>
+                                handleFieldChange("cashActualHanded", v)
+                              }
+                              badge={badgeFor("cashActualHanded")}
+                              error={parseErrors.has("cashActualHanded")}
                             />
                           )}
-                          {t(locale, "wizard.field.shortageExcess")}
-                        </span>
+                        </div>
+                      </div>
+                      <NumberInput
+                        locale={locale}
+                        id="field-spanSystem"
+                        label={t(locale, "wizard.field.span")}
+                        value={rawValues.spanSystem}
+                        onChange={(v) => handleFieldChange("spanSystem", v)}
+                        badge={badgeFor("spanSystem")}
+                        error={parseErrors.has("spanSystem")}
+                      />
+                      <NumberInput
+                        locale={locale}
+                        id="field-deliveryAppsSystem"
+                        label={t(locale, "wizard.field.deliveryApps")}
+                        value={rawValues.deliveryAppsSystem}
+                        onChange={(v) => handleFieldChange("deliveryAppsSystem", v)}
+                        badge={badgeFor("deliveryAppsSystem")}
+                        error={parseErrors.has("deliveryAppsSystem")}
+                      />
+                      <NumberInput
+                        locale={locale}
+                        id="field-reversedTransactions"
+                        label={t(locale, "wizard.field.reversals")}
+                        value={rawValues.reversedTransactions}
+                        onChange={(v) => handleFieldChange("reversedTransactions", v)}
+                        badge={badgeFor("reversedTransactions")}
+                        error={parseErrors.has("reversedTransactions")}
+                      />
+                      {/* Shortage/excess — high-contrast, impossible to miss:
+                          rose shortage / emerald excess / slate balanced. */}
+                      <div
+                        className={`rounded-xl border p-4 ${
+                          soeTone === "shortage"
+                            ? "border-rose-200 bg-rose-50"
+                            : soeTone === "excess"
+                              ? "border-emerald-200 bg-emerald-50"
+                              : "border-slate-200 bg-slate-50"
+                        }`}
+                      >
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <span className="flex items-center gap-2 text-sm font-semibold text-slate-700">
+                            {soeTone === "shortage" ? (
+                              <TrendingDown
+                                className="h-4 w-4 shrink-0 text-rose-600"
+                                aria-hidden="true"
+                              />
+                            ) : soeTone === "excess" ? (
+                              <TrendingUp
+                                className="h-4 w-4 shrink-0 text-emerald-600"
+                                aria-hidden="true"
+                              />
+                            ) : (
+                              <Minus
+                                className="h-4 w-4 shrink-0 text-slate-400"
+                                aria-hidden="true"
+                              />
+                            )}
+                            {t(locale, "wizard.field.shortageExcess")}
+                          </span>
+                          <span
+                            dir="ltr"
+                            className={`text-2xl font-bold tabular-nums ${
+                              soeTone === "shortage"
+                                ? "text-rose-700"
+                                : soeTone === "excess"
+                                  ? "text-emerald-700"
+                                  : "text-slate-500"
+                            }`}
+                          >
+                            {fields.shortageOrExcess.toFixed(2)}{" "}
+                            {t(locale, "wizard.currency")}
+                          </span>
+                        </div>
+                      </div>
+                      {saveError && (
+                        <div className="flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">
+                          <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+                          <span>{saveError}</span>
+                        </div>
+                      )}
+                      {parseErrors.size > 0 && (
+                        <p className="rounded-lg bg-rose-50 px-3 py-2 text-center text-xs font-medium text-rose-700">
+                          {t(locale, "wizard.fixValuesShort")}
+                        </p>
+                      )}
+                      <div className="flex gap-3">
+                        <button
+                          type="button"
+                          className={`${SECONDARY_ACTION_CLASS} flex-1`}
+                          onClick={() => setStep(1)}
+                        >
+                          {t(locale, "common.back")}
+                        </button>
+                        <button
+                          type="button"
+                          className={`${PRIMARY_ACTION_CLASS} flex-1`}
+                          disabled={saving || parseErrors.size > 0}
+                          onClick={handleSave}
+                        >
+                          {saving
+                            ? t(locale, "common.saving")
+                            : t(locale, "wizard.save")}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Step 3 */}
+                  {step === 3 && closingId && (
+                    <div className="space-y-5 text-center">
+                      <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-emerald-100 ring-8 ring-emerald-50">
+                        <Check className="h-8 w-8 text-emerald-600" />
+                      </div>
+                      <h3 className="text-xl font-bold text-slate-900">
+                        {t(locale, "wizard.success.title")}
+                      </h3>
+                      <p className="text-sm text-slate-600">
+                        {t(locale, "wizard.success.id")}{" "}
                         <span
                           dir="ltr"
-                          className={`text-2xl font-bold tabular-nums ${
-                            soeTone === "shortage"
-                              ? "text-rose-700"
-                              : soeTone === "excess"
-                                ? "text-emerald-700"
-                                : "text-slate-500"
-                          }`}
+                          className="rounded-md bg-slate-100 px-2 py-1 font-mono text-sm font-semibold text-slate-800"
                         >
-                          {fields.shortageOrExcess.toFixed(2)}{" "}
-                          {t(locale, "wizard.currency")}
+                          {closingId}
                         </span>
-                      </div>
-                    </div>
-                    {saveError && (
-                      <div className="flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">
-                        <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-                        <span>{saveError}</span>
-                      </div>
-                    )}
-                    {parseErrors.size > 0 && (
-                      <p className="rounded-lg bg-rose-50 px-3 py-2 text-center text-xs font-medium text-rose-700">
-                        {t(locale, "wizard.fixValuesShort")}
                       </p>
-                    )}
-                    <div className="flex gap-3">
-                      <button
-                        type="button"
-                        className={`${SECONDARY_ACTION_CLASS} flex-1`}
-                        onClick={() => setStep(1)}
-                      >
-                        {t(locale, "common.back")}
-                      </button>
-                      <button
-                        type="button"
-                        className={`${PRIMARY_ACTION_CLASS} flex-1`}
-                        disabled={saving || parseErrors.size > 0}
-                        onClick={handleSave}
-                      >
-                        {saving
-                          ? t(locale, "common.saving")
-                          : t(locale, "wizard.save")}
-                      </button>
-                    </div>
-                  </div>
-                )}
-
-                {/* Step 3 */}
-                {step === 3 && closingId && (
-                  <div className="space-y-5 text-center">
-                    <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-emerald-100 ring-8 ring-emerald-50">
-                      <Check className="h-8 w-8 text-emerald-600" />
-                    </div>
-                    <h3 className="text-xl font-bold text-slate-900">
-                      {t(locale, "wizard.success.title")}
-                    </h3>
-                    <p className="text-sm text-slate-600">
-                      {t(locale, "wizard.success.id")}{" "}
-                      <span
-                        dir="ltr"
-                        className="rounded-md bg-slate-100 px-2 py-1 font-mono text-sm font-semibold text-slate-800"
-                      >
-                        {closingId}
-                      </span>
-                    </p>
-                    {saveSource === "local-queued" && (
-                      <div className="flex items-start gap-2.5 rounded-lg border border-amber-200 bg-amber-50 p-3.5 text-start">
-                        <WifiOff className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
-                        <p className="text-sm font-medium text-amber-800">
-                          {t(locale, "wizard.offlineNotice")}
-                        </p>
+                      {saveSource === "local-queued" && (
+                        <div className="flex items-start gap-2.5 rounded-lg border border-amber-200 bg-amber-50 p-3.5 text-start">
+                          <WifiOff className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+                          <p className="text-sm font-medium text-amber-800">
+                            {t(locale, "wizard.offlineNotice")}
+                          </p>
+                        </div>
+                      )}
+                      {displayWarnings.length > 0 && (
+                        <div className="rounded-lg border border-amber-200 bg-amber-50 p-3.5 text-start">
+                          <p className="mb-1 text-xs font-semibold text-amber-900">
+                            {t(locale, "wizard.warnings")}
+                          </p>
+                          <ul className="list-disc space-y-1 ps-5 text-sm text-amber-800">
+                            {displayWarnings.map((w, i) => (
+                              <li key={i}>{t(locale, w)}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                      {saveSource !== "local-queued" && displayWarnings.length === 0 && (
+                        <div className="flex items-start gap-2.5 rounded-lg border border-amber-200 bg-amber-50 p-3.5 text-start">
+                          <Clock className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+                          <p className="text-sm font-medium text-amber-800">
+                            {t(locale, "wizard.awaiting")}
+                          </p>
+                        </div>
+                      )}
+                      <div className="flex flex-wrap items-center justify-center gap-3">
+                        <button
+                          type="button"
+                          onClick={handleStartNewClosing}
+                          className={SECONDARY_ACTION_CLASS}
+                        >
+                          <RotateCcw className="h-4 w-4" />
+                          {t(locale, "wizard.newClosing")}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleBackToHome}
+                          className={SECONDARY_ACTION_CLASS}
+                        >
+                          <BackArrow className="h-4 w-4" />
+                          {t(locale, "wizard.backToHome")}
+                        </button>
+                        <Link href="/" className={PRIMARY_ACTION_CLASS}>
+                          {t(locale, "wizard.backToGateway")}
+                        </Link>
                       </div>
-                    )}
-                    {displayWarnings.length > 0 && (
-                      <div className="rounded-lg border border-amber-200 bg-amber-50 p-3.5 text-start">
-                        <p className="mb-1 text-xs font-semibold text-amber-900">
-                          {t(locale, "wizard.warnings")}
-                        </p>
-                        <ul className="list-disc space-y-1 ps-5 text-sm text-amber-800">
-                          {displayWarnings.map((w, i) => (
-                            <li key={i}>{t(locale, w)}</li>
-                          ))}
-                        </ul>
-                      </div>
-                    )}
-                    {saveSource !== "local-queued" && displayWarnings.length === 0 && (
-                      <div className="flex items-start gap-2.5 rounded-lg border border-amber-200 bg-amber-50 p-3.5 text-start">
-                        <Clock className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
-                        <p className="text-sm font-medium text-amber-800">
-                          {t(locale, "wizard.awaiting")}
-                        </p>
-                      </div>
-                    )}
-                    <div className="flex flex-wrap items-center justify-center gap-3">
-                      <button
-                        type="button"
-                        onClick={handleStartNewClosing}
-                        className={SECONDARY_ACTION_CLASS}
-                      >
-                        <RotateCcw className="h-4 w-4" />
-                        {t(locale, "wizard.newClosing")}
-                      </button>
-                      <Link href="/" className={PRIMARY_ACTION_CLASS}>
-                        {t(locale, "wizard.backToGateway")}
-                      </Link>
                     </div>
-                  </div>
-                )}
+                  )}
+                </div>
               </div>
-            </div>
-          </section>
-        </div>
+            </section>
+          </div>
+        )}
       </div>
 
       {/* --------------------------------------------------------------

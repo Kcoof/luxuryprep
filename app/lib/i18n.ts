@@ -525,6 +525,9 @@ const DICTIONARY: Record<string, Entry> = {
   },
   "wizard.newClosing": { ar: "بدء إقفال جديد", en: "Start New Closing" },
   "wizard.backToGateway": { ar: "العودة للبوابة", en: "Back to Gateway" },
+  // Mode gate: back-to-home control in the closing wizard header (and on
+  // the step-3 success row). Drafts are preserved when going back.
+  "wizard.backToHome": { ar: "العودة للرئيسية", en: "Back to home" },
 
   // -- admin ---------------------------------------------------------------
   "admin.title": { ar: "لوحة مسؤول IT", en: "IT Admin Console" },
